@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "komoot-mcp"
+version = "0.1.0"
+description = "MCP server for Komoot — tours, highlights, route planning & more."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]",
+    "httpx",
+    "python-dotenv",
+]
+
+[project.scripts]
+komoot-mcp = "komoot_mcp.server:main"
