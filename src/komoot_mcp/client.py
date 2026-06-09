@@ -93,7 +93,7 @@ class KomootClient:
             if resp.status_code == 204 or not resp.content:
                 return None
             ctype = resp.headers.get("content-type", "")
-            if "application/json" in ctype:
+            if "json" in ctype:
                 return resp.json()
             return resp.content
         raise KomootError(401, "Authentication failed after retry.")
