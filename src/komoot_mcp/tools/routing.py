@@ -12,6 +12,259 @@ from typing import Any
 from ..client import KomootClient, KomootError
 
 
+# ── Shared helper functions (module-level, no side effects) ────────────
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine distance between two points in km."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1))
+         * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def _segment_km(coords: list[dict[str, Any]], from_i: int, to_i: int) -> float:
+    """Sum of Haversine distances between consecutive coords from from_i to to_i."""
+    total = 0.0
+    for i in range(max(0, from_i), min(to_i, len(coords) - 1)):
+        c1 = coords[i]
+        c2 = coords[i + 1]
+        try:
+            total += _haversine_km(
+                float(c1.get("lat", 0)), float(c1.get("lng", 0)),
+                float(c2.get("lat", 0)), float(c2.get("lng", 0)),
+            )
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def _compute_singletrail(
+    wt_items: list[dict[str, Any]],
+    coord_items: list[dict[str, Any]],
+    total_km: float,
+) -> dict[str, Any]:
+    """Compute singletrail breakdown from way-type items and coordinates.
+
+    Extracts trail_d1..trail_d5 segments, merges overlapping intervals,
+    calculates Haversine distance for each type, and returns total + percentage.
+
+    Returns {'available': False} when no trail_d* data is present.
+    """
+    if not wt_items or not coord_items:
+        return {"available": False}
+
+    # Filter trail_d1..trail_d5
+    trail_by_type: dict[str, list[dict[str, Any]]] = {}
+    for item in wt_items:
+        if not isinstance(item, dict):
+            continue
+        element = item.get("element", "")
+        if not isinstance(element, str) or not element.startswith("wt#trail_d"):
+            continue
+        key = element.replace("wt#", "")
+        trail_by_type.setdefault(key, []).append({
+            "from": item.get("from"),
+            "to": item.get("to"),
+        })
+
+    if not trail_by_type:
+        return {"available": False}
+
+    st_out: dict[str, Any] = {}
+    st_total_km = 0.0
+
+    for trail_key in sorted(trail_by_type.keys()):
+        intervals = trail_by_type[trail_key]
+        intervals.sort(key=lambda x: int(x.get("from", 0) or 0))
+
+        # Merge overlapping intervals
+        merged: list[dict[str, Any]] = []
+        for iv in intervals:
+            if not merged:
+                merged.append(dict(iv))
+            else:
+                last = merged[-1]
+                fv = int(iv.get("from") or 0)
+                lv = int(iv.get("to") or 0)
+                lf = int(last.get("from") or 0)
+                lt = int(last.get("to") or 0)
+                if fv <= lt:
+                    last["to"] = max(lt, lv)
+                else:
+                    merged.append(dict(iv))
+
+        # Calculate distance
+        d_km: float | None = None
+        if coord_items and merged:
+            try:
+                seg_d = 0.0
+                for m in merged:
+                    fi = int(m.get("from") or 0)
+                    ti = int(m.get("to") or 0)
+                    if 0 <= fi < ti <= len(coord_items):
+                        seg_d += _segment_km(coord_items, fi, ti)
+                if seg_d > 0:
+                    d_km = round(seg_d, 2)
+            except (TypeError, ValueError, IndexError):
+                d_km = None
+
+        entry: dict[str, Any] = {
+            "segments": len(intervals),
+            "from_to": [[int(iv["from"]), int(iv["to"])] for iv in intervals],
+        }
+        if d_km is not None:
+            entry["distance_km"] = d_km
+            st_total_km += d_km
+        st_out[trail_key] = entry
+
+    # Ordered by d1..d5 (only existing types)
+    ordered: dict[str, Any] = {}
+    for d in range(1, 6):
+        key = f"trail_d{d}"
+        if key in st_out:
+            ordered[key] = st_out[key]
+
+    if st_total_km > 0:
+        ordered["singletrail_total_km"] = round(st_total_km, 2)
+        if total_km and total_km > 0:
+            ordered["singletrail_percentage"] = round(
+                st_total_km / total_km * 100, 1
+            )
+
+    return ordered
+
+
+def _compact_route_summary(raw: dict[str, Any]) -> dict[str, Any]:
+    """Convert raw plan_route API response into a compact route summary.
+
+    Uses the same extraction pattern as import_gpx_file, enriched with
+    singletrail data from _embedded way-type items + coordinates.
+    No additional API calls are made.
+    """
+    result: dict[str, Any] = {}
+
+    # Distance
+    if "distance" in raw:
+        d = float(raw["distance"])
+        result["distance_km"] = round(d / 1000.0, 2)
+        result["distance_m"] = round(d, 1)
+
+    # Elevation
+    if "elevation_up" in raw:
+        result["elevation_up_m"] = round(float(raw["elevation_up"]), 1)
+    if "elevation_down" in raw:
+        result["elevation_down_m"] = round(float(raw["elevation_down"]), 1)
+
+    # Duration
+    if "duration" in raw:
+        dur_s = int(float(raw["duration"]))
+        result["duration_seconds"] = dur_s
+        h = dur_s // 3600
+        m = (dur_s % 3600) // 60
+        result["duration"] = f"{h}h {m}m" if h else f"{m}m"
+
+    # Difficulty (grade + T/C)
+    diff = raw.get("difficulty")
+    if isinstance(diff, dict):
+        if diff.get("grade"):
+            result["difficulty"] = diff["grade"]
+        tech_raw = diff.get("explanation_technical", "")
+        if tech_raw and isinstance(tech_raw, str) and "#" in tech_raw:
+            result["technical_difficulty"] = tech_raw.split("#", 1)[1].upper()
+        fit_raw = diff.get("explanation_fitness", "")
+        if fit_raw and isinstance(fit_raw, str) and "#" in fit_raw:
+            result["fitness_difficulty"] = fit_raw.split("#", 1)[1].upper()
+
+    total_km = result.get("distance_km", 0)
+
+    # Way types (percentage + approximated km from total distance)
+    summary = raw.get("summary", {})
+    if isinstance(summary, dict):
+        wts = summary.get("way_types", [])
+        if isinstance(wts, list):
+            result["way_types"] = {
+                str(item["type"]).replace("wt#", ""): {
+                    "percentage": round(float(item["amount"]) * 100, 1),
+                    "distance_km": round(float(item["amount"]) * total_km, 2)
+                    if total_km > 0 else 0.0,
+                }
+                for item in wts
+                if isinstance(item, dict) and "type" in item and "amount" in item
+            }
+
+        # Surfaces (percentage + approximated km from total distance)
+        surfaces = summary.get("surfaces", [])
+        if isinstance(surfaces, list):
+            result["surfaces"] = {
+                str(item["type"]).replace("sm#", ""): {
+                    "percentage": round(float(item["amount"]) * 100, 1),
+                    "distance_km": round(float(item["amount"]) * total_km, 2)
+                    if total_km > 0 else 0.0,
+                }
+                for item in surfaces
+                if isinstance(item, dict) and "type" in item and "amount" in item
+            }
+
+    # Singletrail (from _embedded.way_types.items + coordinates)
+    embedded = raw.get("_embedded", {})
+    if isinstance(embedded, dict):
+        wt_container = embedded.get("way_types", {})
+        wt_items: list[dict[str, Any]] = []
+        if isinstance(wt_container, dict):
+            wt_items = wt_container.get("items", [])
+        elif isinstance(wt_container, list):
+            wt_items = wt_container
+        if not isinstance(wt_items, list):
+            wt_items = []
+
+        coord_container = embedded.get("coordinates", {})
+        coord_items: list[dict[str, Any]] = []
+        if isinstance(coord_container, dict):
+            coord_items = coord_container.get("items", [])
+        elif isinstance(coord_container, list):
+            coord_items = coord_container
+        if not isinstance(coord_items, list):
+            coord_items = []
+
+        result["singletrail"] = _compute_singletrail(
+            wt_items, coord_items, total_km
+        )
+
+        # Coordinate count — NOT the full list
+        if coord_items:
+            result["matched_coordinates"] = len(coord_items)
+
+    # Segments
+    segs = raw.get("segments", [])
+    if isinstance(segs, list):
+        routed = sum(
+            1 for s in segs if isinstance(s, dict) and s.get("type") == "Routed"
+        )
+        manual = sum(
+            1 for s in segs if isinstance(s, dict) and s.get("type") == "Manual"
+        )
+        result["segments"] = {"routed": routed, "manual": manual}
+
+    # Tour information
+    ti = raw.get("tour_information", [])
+    if isinstance(ti, list) and ti:
+        info_list: list[dict[str, Any]] = []
+        for item in ti:
+            if isinstance(item, dict) and item.get("type"):
+                segs = item.get("segments", [])
+                info_list.append({
+                    "type": str(item["type"]),
+                    "segments": len(segs) if isinstance(segs, list) else 0,
+                })
+        result["tour_information"] = info_list
+
+    return result
+
+
 def register(mcp, client: KomootClient) -> None:
     @mcp.tool()
     async def import_gpx_route(
@@ -250,6 +503,7 @@ def register(mcp, client: KomootClient) -> None:
     async def plan_route(
         coordinates: list[list[float]],
         sport: str = "hike",
+        compact: bool = False,
     ) -> dict[str, Any]:
         """Planifier un itineraire Komoot a partir de waypoints.
 
@@ -257,6 +511,11 @@ def register(mcp, client: KomootClient) -> None:
             coordinates: liste de [lat, lng] pour les points de passage
                          (ex: [[48.5734, 7.7521], [48.5801, 7.7612]]).
             sport: type de sport ('hike', 'touringbicycle', 'mtb', 'racebicycle', 'jogging').
+            compact: si True, renvoie un resume compact de la route
+                     (distance, elevation, duree, difficulte, way_types,
+                     surfaces, singletrail, segments) au lieu de la
+                     reponse complete de l'API Komoot. Defaut: False
+                     (comportement historique, retrocompatible).
         """
         # Build path (indexed waypoints) and segments (Routed geometry between consecutive points)
         path = []
@@ -280,6 +539,8 @@ def register(mcp, client: KomootClient) -> None:
                 "_embedded": "coordinates,way_types,surfaces,directions",
             },
         )
+        if compact:
+            return _compact_route_summary(result)
         return result
 
     def _prepare_planned_tour_payload(
@@ -439,20 +700,6 @@ def register(mcp, client: KomootClient) -> None:
         if not isinstance(wt_items, list):
             wt_items = []
 
-        # Filter trail_d1..trail_d5
-        trail_by_type: dict[str, list[dict[str, Any]]] = {}
-        for item in wt_items:
-            if not isinstance(item, dict):
-                continue
-            element = item.get("element", "")
-            if not isinstance(element, str) or not element.startswith("wt#trail_d"):
-                continue
-            key = element.replace("wt#", "")
-            trail_by_type.setdefault(key, []).append({
-                "from": item.get("from"),
-                "to": item.get("to"),
-            })
-
         # Coordinates
         coord_container = embedded.get("coordinates", {})
         coord_items: list[dict[str, Any]] = []
@@ -463,93 +710,8 @@ def register(mcp, client: KomootClient) -> None:
         if not isinstance(coord_items, list):
             coord_items = []
 
-        # Haversine
-        def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-            R = 6371.0
-            dlat = math.radians(lat2 - lat1)
-            dlon = math.radians(lon2 - lon1)
-            a = (math.sin(dlat / 2) ** 2
-                 + math.cos(math.radians(lat1))
-                 * math.cos(math.radians(lat2))
-                 * math.sin(dlon / 2) ** 2)
-            return R * 2 * math.asin(math.sqrt(a))
-
-        def _segment_km(coords: list[dict[str, Any]], from_i: int, to_i: int) -> float:
-            total = 0.0
-            for i in range(max(0, from_i), min(to_i, len(coords) - 1)):
-                c1 = coords[i]
-                c2 = coords[i + 1]
-                try:
-                    total += _haversine_km(
-                        float(c1.get("lat", 0)), float(c1.get("lng", 0)),
-                        float(c2.get("lat", 0)), float(c2.get("lng", 0)),
-                    )
-                except (TypeError, ValueError):
-                    pass
-            return total
-
-        # Build singletrail output
-        st_out: dict[str, Any] = {}
-        st_total_km = 0.0
         total_km = result.get("distance_km", 0)
-
-        for trail_key in sorted(trail_by_type.keys()):
-            intervals = trail_by_type[trail_key]
-            intervals.sort(key=lambda x: int(x.get("from", 0) or 0))
-
-            # Merge overlapping intervals for distance calculation
-            merged: list[dict[str, Any]] = []
-            for iv in intervals:
-                if not merged:
-                    merged.append(dict(iv))
-                else:
-                    last = merged[-1]
-                    fv = int(iv.get("from") or 0)
-                    lv = int(iv.get("to") or 0)
-                    lf = int(last.get("from") or 0)
-                    lt = int(last.get("to") or 0)
-                    if fv <= lt:
-                        last["to"] = max(lt, lv)
-                    else:
-                        merged.append(dict(iv))
-
-            # Calculate distance
-            d_km: float | None = None
-            if coord_items and merged:
-                try:
-                    seg_d = 0.0
-                    for m in merged:
-                        fi = int(m.get("from") or 0)
-                        ti = int(m.get("to") or 0)
-                        if 0 <= fi < ti <= len(coord_items):
-                            seg_d += _segment_km(coord_items, fi, ti)
-                    if seg_d > 0:
-                        d_km = round(seg_d, 2)
-                except (TypeError, ValueError, IndexError):
-                    d_km = None
-
-            entry: dict[str, Any] = {
-                "segments": len(intervals),
-                "from_to": [[int(iv["from"]), int(iv["to"])] for iv in intervals],
-            }
-            if d_km is not None:
-                entry["distance_km"] = d_km
-                st_total_km += d_km
-            st_out[trail_key] = entry
-
-        # Ordered by d1..d5 (only existing types)
-        ordered: dict[str, Any] = {}
-        for d in range(1, 6):
-            key = f"trail_d{d}"
-            if key in st_out:
-                ordered[key] = st_out[key]
-
-        if st_total_km > 0:
-            ordered["singletrail_total_km"] = round(st_total_km, 2)
-            if total_km and total_km > 0:
-                ordered["singletrail_percentage"] = round(st_total_km / total_km * 100, 1)
-
-        result["singletrail"] = ordered
+        result["singletrail"] = _compute_singletrail(wt_items, coord_items, total_km)
 
         # Coordinate count (not the actual list)
         if coord_items:
