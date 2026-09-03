@@ -258,25 +258,29 @@ def register(mcp, client: KomootClient) -> None:
                          (ex: [[48.5734, 7.7521], [48.5801, 7.7612]]).
             sport: type de sport ('hike', 'touringbicycle', 'mtb', 'racebicycle', 'jogging').
         """
-        # Construire le payload de routing Komoot
+        # Build path (indexed waypoints) and segments (Routed geometry between consecutive points)
+        path = []
         segments = []
         for i, coord in enumerate(coordinates):
             point = {"lat": coord[0], "lng": coord[1], "alt": 0.0}
-            if i == 0:
-                segments.append({"type": "start", "location": point})
-            elif i == len(coordinates) - 1:
-                segments.append({"type": "end", "location": point})
-            else:
-                segments.append({"type": "via", "location": point})
+            path.append({"location": point, "index": i})
+            if i > 0:
+                prev_coord = coordinates[i - 1]
+                prev_point = {"lat": prev_coord[0], "lng": prev_coord[1], "alt": 0.0}
+                segments.append({"type": "Routed", "geometry": [prev_point, point]})
 
-        return await client.post_www(
+        result = await client.post_www(
             "/routing/tour",
-            json_body={"segments": segments},
-            params={
+            json_body={
+                "path": path,
+                "segments": segments,
                 "sport": sport,
+            },
+            params={
                 "_embedded": "coordinates,way_types,surfaces,directions",
             },
         )
+        return result
 
     def _prepare_planned_tour_payload(
         route_data: dict[str, Any],
