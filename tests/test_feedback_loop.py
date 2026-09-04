@@ -606,6 +606,48 @@ class TestFeedbackIterationSummary:
 # ══════════════════════════════════════════════════════════════════════
 
 
+class TestFeedbackAudit:
+    """Feedback audit is observational and preserves waypoint selection."""
+
+    def test_selected_waypoints_are_logged(self, two_classified_clusters):
+        from komoot_mcp.tools.routing import _suggest_uncovered_waypoints_with_audit
+        analyzed = [
+            _cluster_entry(0, 2.0, ["classified"], center={"lat": 47.51, "lng": 10.01}),
+            _cluster_entry(1, 80.0, ["classified"]),
+        ]
+        suggestions, audit = _suggest_uncovered_waypoints_with_audit(
+            two_classified_clusters, analyzed, max_new=2,
+        )
+        selected = [item for item in audit if item["selected"]]
+        assert len(suggestions) == 2
+        assert len(selected) == 2
+        assert all(item["cluster_id"] == 0 for item in selected)
+        assert all(item["selection_source"] == "suggest_uncovered_waypoints" for item in selected)
+        assert {item["waypoint_kind"] for item in selected} == {"entry", "exit"}
+
+    def test_unknown_cluster_coordinates_are_not_invented(self):
+        from komoot_mcp.tools.routing import _suggest_uncovered_waypoints_with_audit
+        analyzed = [_cluster_entry(4, 2.0, ["other"])]
+        suggestions, audit = _suggest_uncovered_waypoints_with_audit(
+            [], analyzed, max_new=2,
+        )
+        assert suggestions == []
+        assert audit[0]["cluster_id"] == 4
+        assert audit[0]["waypoint"] is None
+        assert audit[0]["entry"] is None
+        assert audit[0]["exit"] is None
+
+    def test_cluster_transition_reports_status_changes(self):
+        from komoot_mcp.tools.routing import _cluster_transition
+        before = {"covered": [], "partial": [_cluster_entry(1, 40, ["classified"])],
+                  "uncovered": [_cluster_entry(2, 2, ["classified"])]}
+        after = {"covered": [_cluster_entry(1, 75, ["classified"])],
+                 "partial": [], "uncovered": [_cluster_entry(2, 2, ["classified"])]}
+        diff = _cluster_transition(before, after)
+        assert diff["new_covered"] == [1]
+        assert diff["partial_to_covered"] == [1]
+
+
 class TestRunFeedbackLoop:
     """_run_feedback_loop integration tests."""
 

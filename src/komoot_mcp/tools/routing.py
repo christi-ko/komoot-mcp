@@ -485,6 +485,88 @@ def suggest_uncovered_waypoints(
     return [s[0] for s in suggestions]
 
 
+def _suggest_uncovered_waypoints_with_audit(
+    clusters: list[dict[str, Any]],
+    analyzed: list[dict[str, Any]],
+    current_waypoints: list[list[float]] | None = None,
+    max_new: int = 2,
+) -> tuple[list[list[float]], list[dict[str, Any]]]:
+    """Return historical suggestions and an audit without changing selection."""
+    suggestions = suggest_uncovered_waypoints(
+        clusters, analyzed, current_waypoints=current_waypoints, max_new=max_new
+    )
+    candidates = sorted(
+        (c for c in analyzed if c.get("coverage_percentage", 100) < 70),
+        key=lambda c: c.get("coverage_percentage", 100),
+    )
+    audit: list[dict[str, Any]] = []
+    # Consume each selected coordinate exactly once.  Entry and exit can be
+    # identical (or shared by adjacent clusters); a set alone would falsely
+    # mark both audit records as selected for one actual waypoint.
+    selected_counts: dict[tuple[float, float], int] = {}
+    for wp in suggestions:
+        key = (float(wp[0]), float(wp[1]))
+        selected_counts[key] = selected_counts.get(key, 0) + 1
+    for priority, candidate in enumerate(candidates, start=1):
+        idx = candidate.get("cluster_index")
+        cl = clusters[idx] if isinstance(idx, int) and idx < len(clusters) else None
+        status = ("uncovered" if candidate.get("coverage_percentage", 0) < 10
+                  else "partial")
+        entry = (cl or {}).get("start") or {}
+        exit_ = (cl or {}).get("end") or {}
+        points = [
+            ("entry", [entry.get("lat"), entry.get("lng")]),
+            ("exit", [exit_.get("lat"), exit_.get("lng")]),
+        ]
+        for kind, point in points:
+            valid = all(isinstance(v, (int, float)) for v in point)
+            lat, lng = point
+            wp = ([round(float(lat), 6), round(float(lng), 6)]
+                  if valid else None)
+            key = (float(wp[0]), float(wp[1])) if wp is not None else None
+            is_selected = bool(key is not None and selected_counts.get(key, 0) > 0)
+            if is_selected:
+                selected_counts[key] -= 1
+            audit.append({
+                "cluster_id": idx,
+                "classification": ((candidate.get("trail_categories") or ["other"])[0]),
+                "trail_km": candidate.get("total_length_km"),
+                "cluster_center": candidate.get("center"),
+                "entry": {"latitude": entry.get("lat"), "longitude": entry.get("lng")} if entry else None,
+                "exit": {"latitude": exit_.get("lat"), "longitude": exit_.get("lng")} if exit_ else None,
+                "status_before": status,
+                "priority": priority,
+                "selected": is_selected,
+                "waypoint": ({"latitude": float(wp[0]), "longitude": float(wp[1])}
+                              if is_selected and wp is not None else None),
+                "waypoint_kind": kind if is_selected else None,
+                "selection_source": "suggest_uncovered_waypoints" if is_selected else None,
+                "reason": ("selected_by_existing_order" if is_selected
+                           else "not_selected_by_existing_budget_or_order"),
+            })
+    return suggestions, audit
+
+
+def _cluster_status_map(trail_clusters: dict[str, Any]) -> dict[Any, str]:
+    return {
+        c.get("cluster_index"): status
+        for status in ("covered", "partial", "uncovered")
+        for c in trail_clusters.get(status, [])
+    }
+
+
+def _cluster_transition(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    before, after = _cluster_status_map(previous), _cluster_status_map(current)
+    return {
+        "previous": {s: sorted(i for i, v in before.items() if v == s)
+                     for s in ("uncovered", "partial", "covered")},
+        "current": {s: sorted(i for i, v in after.items() if v == s)
+                    for s in ("uncovered", "partial", "covered")},
+        "new_covered": sorted(i for i, v in after.items() if v == "covered" and before.get(i) != "covered"),
+        "partial_to_covered": sorted(i for i, v in after.items() if v == "covered" and before.get(i) == "partial"),
+    }
+
+
 def _compact_cluster_info(
     analyzed: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -863,6 +945,8 @@ async def _run_feedback_loop(
     current_coords = [list(c) for c in initial_coordinates]
     raw_iterations: list[dict[str, Any]] = []
     improvement_log: list[str] = []
+    feedback_decisions: list[dict[str, Any]] = []
+    feedback_transitions: list[dict[str, Any]] = []
 
     for attempt in range(1, max_iterations + 1):
         # ── Route ────────────────────────────────────────────────
@@ -889,6 +973,22 @@ async def _run_feedback_loop(
         if selection_constraints is not None:
             route["selection_constraints"] = dict(selection_constraints)
         route["_waypoints"] = [list(c) for c in current_coords]
+        if raw_iterations:
+            previous_route = raw_iterations[-1]
+            feedback_transitions.append({
+                "from_attempt": previous_route.get("_attempt"),
+                "to_attempt": attempt,
+                "cluster_diff": _cluster_transition(
+                    previous_route.get("trail_clusters") or {},
+                    route.get("trail_clusters") or {},
+                ),
+                "metrics": {
+                    "distance_km": {"before": previous_route.get("distance_km"), "after": route.get("distance_km")},
+                    "elevation_up_m": {"before": previous_route.get("elevation_up_m"), "after": route.get("elevation_up_m")},
+                    "asphalt": {"before": (previous_route.get("surfaces") or {}).get("asphalt"), "after": (route.get("surfaces") or {}).get("asphalt")},
+                    "trail_coverage": {"before": (previous_route.get("trail_coverage") or {}).get("classified"), "after": (route.get("trail_coverage") or {}).get("classified")},
+                },
+            })
         raw_iterations.append(route)
 
         # ── Decide whether to continue ───────────────────────────
@@ -915,12 +1015,18 @@ async def _run_feedback_loop(
 
         # ── Generate targeted waypoints ──────────────────────────
         analyzed = _build_analyzed_from_clusters(trail_clusters)
-        suggestions = suggest_uncovered_waypoints(
+        suggestions, candidate_audit = _suggest_uncovered_waypoints_with_audit(
             discovered_clusters,
             analyzed,
             current_waypoints=current_coords,
             max_new=2,
         )
+        feedback_decisions.append({
+            "from_attempt": attempt,
+            "to_attempt": attempt + 1,
+            "candidates": candidate_audit,
+            "selected_waypoints": [item for item in candidate_audit if item.get("selected")],
+        })
 
         if not suggestions:
             improvement_log.append(
@@ -982,6 +1088,8 @@ async def _run_feedback_loop(
         "improvement_log": improvement_log,
         "clusters_covered": clusters_covered,
         "clusters_uncovered_indices": uncovered_indices,
+        "feedback_decisions": feedback_decisions,
+        "feedback_transitions": feedback_transitions,
     }
 
 
