@@ -77,12 +77,41 @@ def _extract_coord_items(tour: dict[str, Any]) -> list[dict[str, Any]]:
 
 # ── Core feature functions ─────────────────────────────────────────────
 
+def _trail_category(element: str) -> str | None:
+    """Classify a way-type element into trail category.
+
+    Returns:
+        'classified' for trail_d1..trail_d5,
+        'unclassified' for wt#trail without numeric suffix,
+        None for non-trail elements.
+    """
+    if not isinstance(element, str):
+        return None
+    if element.startswith("wt#trail_d"):
+        return "classified"
+    if element == "wt#trail":
+        return "unclassified"
+    return None
+
+
+def _classified_sort_key(seg: dict[str, Any]) -> tuple:
+    """Sort key: classified trails first, then by length descending."""
+    cat = seg.get("trail_category", "unclassified")
+    cat_order = 0 if cat == "classified" else 1
+    length = -seg.get("length_km", 0)
+    return (cat_order, length)
+
+
 def extract_trail_segments(
     wt_items: list[dict[str, Any]],
     coord_items: list[dict[str, Any]],
     tour_id: int,
 ) -> list[dict[str, Any]]:
     """Extract individual trail segments from way-type items and coordinates.
+
+    Detects both classified singletrail (trail_d1..trail_d5) and unclassified
+    trail (wt#trail without numeric suffix). Each segment includes a
+    `trail_category` field: 'classified' or 'unclassified'.
 
     Args:
         wt_items: way_type items from Komoot API _embedded.way_types.items.
@@ -91,9 +120,9 @@ def extract_trail_segments(
 
     Returns:
         List of segment dicts, each with:
-          start, end (lat/lng), length_km, way_type,
+          start, end (lat/lng), length_km, way_type, trail_category,
           from_index, to_index, source_tour_id.
-        Empty list when no trail_d* data exists.
+        Empty list when no trail data exists.
     """
     if not wt_items or not coord_items:
         return []
@@ -104,12 +133,14 @@ def extract_trail_segments(
         if not isinstance(item, dict):
             continue
         element = item.get("element", "")
-        if not isinstance(element, str):
-            continue
-        if not element.startswith("wt#trail_d"):
+        category = _trail_category(element)
+        if category is None:
             continue
 
-        way_type = element.replace("wt#", "")  # trail_d1 .. trail_d5
+        way_type = element.replace("wt#", "")  # trail_d1..trail_d5 or just "trail"
+        if category == "unclassified":
+            way_type = "trail_unclassified"  # distinct name for non-d trail
+
         fi = int(item.get("from", 0) or 0)
         ti = int(item.get("to", 0) or 0)
 
@@ -132,6 +163,7 @@ def extract_trail_segments(
             },
             "length_km": length_km,
             "way_type": way_type,
+            "trail_category": category,
             "from_index": fi,
             "to_index": ti,
             "source_tour_id": tour_id,
@@ -162,6 +194,7 @@ def cluster_trail_segments(
         List of cluster dicts:
           { segments: [...], total_length_km: float,
             source_tour_ids: list[int], way_types: list[str],
+            trail_categories: list[str],
             start: {lat, lng}, end: {lat, lng} }
     """
     if not segments:
@@ -189,11 +222,16 @@ def cluster_trail_segments(
         total_len = round(sum(s.get("length_km", 0) for s in group), 4)
         source_ids = sorted(set(s["source_tour_id"] for s in group))
         way_types = list(dict.fromkeys(s["way_type"] for s in group))  # ordered unique
+        trail_cats = list(dict.fromkeys(
+            s["trail_category"] for s in group
+            if s.get("trail_category")
+        ))  # ordered unique categories present
         result.append({
             "segments": len(group),
             "total_length_km": total_len,
             "source_tour_ids": source_ids,
             "way_types": way_types,
+            "trail_categories": trail_cats,
             "start": group[0]["start"],
             "end": group[-1]["end"],
         })
@@ -329,13 +367,19 @@ def derive_routing_waypoints(
             "exit": exit_pt,
             "centroid": centroid,
             "length_km": cl.get("total_length_km", 0),
+            "trail_category_priority": 0 if "classified" in cl.get("trail_categories", []) else 1,
         })
 
     if not cluster_data:
         return []
 
-    # ── Sort by trail length descending ──────────────────────────────
-    cluster_data.sort(key=lambda c: c["length_km"], reverse=True)
+    # ── Sort by trail category first, then length ─────────────────────
+    def _cluster_priority(cd: dict[str, Any]) -> tuple:
+        """Sort key: classified first, then unclassified, then length."""
+        cat = cd.get("trail_category_priority", 1)
+        return (cat, -cd["length_km"])
+
+    cluster_data.sort(key=_cluster_priority)
 
     # ── Compute spatial diversity threshold ──────────────────────────
     # Based on spread of centroids (minimum 100m, max 2km)

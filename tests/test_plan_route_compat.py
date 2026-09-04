@@ -64,6 +64,11 @@ def test_plan_route_compact_false_returns_summary_with_ref(
     assert "route_ref" in result
     assert result["route_ref"].startswith("route_")
 
+    # Must contain route_overlap (always computed)
+    assert "route_overlap" in result
+    assert "overlap_km" in result["route_overlap"]
+    assert "overlap_percentage" in result["route_overlap"]
+
     # Must NOT contain large geometry
     assert "path" not in result
     assert "coordinates" not in result
