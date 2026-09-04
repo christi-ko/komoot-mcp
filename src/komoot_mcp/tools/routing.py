@@ -6,10 +6,19 @@ Inspires du projet export-komoot (Go) de pieterclaerhout.
 
 from __future__ import annotations
 
+import asyncio
 import math
+import time
 from typing import Any
+from uuid import uuid4
 
 from ..client import KomootClient, KomootError
+
+# ── Internal route cache for compact=False → create_planned_tour flow ──
+# Maps route_ref -> (timestamp, full_route_data)
+_route_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_route_cache_lock = asyncio.Lock()
+_CACHE_TTL = 3600  # 1 hour
 
 
 # ── Shared helper functions (module-level, no side effects) ────────────
@@ -541,7 +550,20 @@ def register(mcp, client: KomootClient) -> None:
         )
         if compact:
             return _compact_route_summary(result)
-        return result
+
+        # compact=False: cache full result internally, return compact summary + route_ref
+        route_ref = f"route_{uuid4().hex}"
+        now = time.time()
+        async with _route_cache_lock:
+            # Opportunistic cleanup of expired entries
+            for ref in list(_route_cache.keys()):
+                if now - _route_cache[ref][0] > _CACHE_TTL:
+                    del _route_cache[ref]
+            _route_cache[route_ref] = (now, result)
+
+        summary = _compact_route_summary(result)
+        summary["route_ref"] = route_ref
+        return summary
 
     def _prepare_planned_tour_payload(
         route_data: dict[str, Any],
@@ -572,9 +594,121 @@ def register(mcp, client: KomootClient) -> None:
                 del payload[key]
         return payload
 
+    def _validate_route_data_for_save(
+        route_data: dict[str, Any],
+    ) -> str | None:
+        """Validate route_data is suitable for create_planned_tour.
+
+        Returns None if valid, or an error string explaining what's wrong.
+
+        Checks:
+        - Fields use the full plan_route() format (compact=False), not the
+          compact summary (compact=True).
+        - Required fields exist and have correct types:
+          distance (numeric), duration (numeric), elevation_up (numeric),
+          elevation_down (numeric), path (list), segments (list),
+          _embedded (dict).
+        """
+        # ── Detect compact=True format ──────────────────────────────────
+        if "distance_km" in route_data:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). The compact summary cannot be used for saving. "
+                "Detected 'distance_km' field (compact format); expected 'distance'."
+            )
+        if "elevation_up_m" in route_data:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). Detected compact-style field "
+                "'elevation_up_m'; expected 'elevation_up'."
+            )
+        if "elevation_down_m" in route_data:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). Detected compact-style field "
+                "'elevation_down_m'; expected 'elevation_down'."
+            )
+
+        # ── Check required top-level fields ─────────────────────────────
+        required_numeric = ["distance", "duration", "elevation_up", "elevation_down"]
+        for field in required_numeric:
+            value = route_data.get(field)
+            if value is None:
+                return (
+                    f"create_planned_tour requires the full plan_route() result "
+                    f"(compact=False). Missing required numeric field '{field}'."
+                )
+            if isinstance(value, str):
+                return (
+                    f"create_planned_tour requires the full plan_route() result "
+                    f"(compact=False). Expected numeric value for '{field}', "
+                    f"got string '{value}'."
+                )
+            if not isinstance(value, (int, float)):
+                return (
+                    f"create_planned_tour requires the full plan_route() result "
+                    f"(compact=False). Expected numeric value for '{field}', "
+                    f"got {type(value).__name__}."
+                )
+
+        # ── Check path ──────────────────────────────────────────────────
+        path = route_data.get("path")
+        if path is None:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). Missing required field 'path'."
+            )
+        if not isinstance(path, list):
+            return (
+                f"create_planned_tour requires the full plan_route() result "
+                f"(compact=False). Expected 'path' to be a list, "
+                f"got {type(path).__name__}."
+            )
+        if len(path) == 0:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). 'path' is empty."
+            )
+
+        # ── Check segments ──────────────────────────────────────────────
+        segments = route_data.get("segments")
+        if segments is None:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). Missing required field 'segments'."
+            )
+        if not isinstance(segments, list):
+            return (
+                f"create_planned_tour requires the full plan_route() result "
+                f"(compact=False). Expected 'segments' to be a list, "
+                f"got {type(segments).__name__}."
+            )
+        if len(segments) == 0:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). 'segments' is empty."
+            )
+
+        # ── Check _embedded ─────────────────────────────────────────────
+        embedded = route_data.get("_embedded")
+        if embedded is None:
+            return (
+                "create_planned_tour requires the full plan_route() result "
+                "(compact=False). Missing required field '_embedded'."
+            )
+        if not isinstance(embedded, dict):
+            return (
+                f"create_planned_tour requires the full plan_route() result "
+                f"(compact=False). Expected '_embedded' to be a dict, "
+                f"got {type(embedded).__name__}."
+            )
+
+        return None
+
     @mcp.tool()
     async def create_planned_tour(
-        route_data: dict[str, Any],
+        route_data: dict[str, Any] | None = None,
+        route_ref: str = "",
         name: str = "Tour planifie",
         sport: str = "hike",
     ) -> dict[str, Any]:
@@ -582,9 +716,45 @@ def register(mcp, client: KomootClient) -> None:
 
         Args:
             route_data: resultat JSON de plan_route() ou import_gpx_route().
+            route_ref: reference de route depuis plan_route(compact=False).
+                       Si fournie, route_data est ignore et la route est chargee depuis le cache interne.
             name: nom du tour planifie.
             sport: type de sport.
         """
+        # ── Load route_data from cache if route_ref is provided ─────────
+        if route_ref:
+            async with _route_cache_lock:
+                entry = _route_cache.get(route_ref)
+                if entry is None:
+                    return {
+                        "status": "error",
+                        "error": f"route_ref '{route_ref}' is invalid or expired",
+                    }
+                ts, cached_data = entry
+                if time.time() - ts > _CACHE_TTL:
+                    _route_cache.pop(route_ref, None)
+                    return {
+                        "status": "error",
+                        "error": f"route_ref '{route_ref}' has expired",
+                    }
+                route_data = cached_data
+                # Keep in cache until validation passes (so a retry is possible)
+        elif route_data is None:
+            return {
+                "status": "error",
+                "error": "Either route_data or route_ref is required",
+            }
+
+        # ── Validate route_data before sending to Komoot ───────────────
+        error = _validate_route_data_for_save(route_data)
+        if error is not None:
+            return {"status": "error", "error": error}
+
+        # ── Remove from cache now that validation passed ───────────────
+        if route_ref:
+            async with _route_cache_lock:
+                _route_cache.pop(route_ref, None)
+
         payload = _prepare_planned_tour_payload(route_data, name, sport)
         return await client.request(
             "POST",
