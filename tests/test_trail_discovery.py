@@ -722,3 +722,65 @@ class TestDeriveRoutingWaypoints:
         ]
         wps = derive_routing_waypoints(cls, max_points=8)
         assert len(wps) == 4  # 2 pairs, no artificial filling
+
+    # -- Trail category priority ---------------------------------------
+
+    def _make_cluster_with_category(self, lat_start, lng_start, lat_end, lng_end,
+                                    length_km=1.0, tid=1001, trail_categories=None):
+        """Like _make_cluster but also sets trail_categories."""
+        cl = self._make_cluster(lat_start, lng_start, lat_end, lng_end,
+                                length_km=length_km, tid=tid)
+        if trail_categories is not None:
+            cl["trail_categories"] = trail_categories
+        return cl
+
+    def test_classified_beats_longer_unclassified(self):
+        """Klassifizierter Cluster (kürzer) bekommt Paar vor längerem unclassified."""
+        cls = [
+            self._make_cluster_with_category(
+                48.0, 10.0, 48.006, 10.006, length_km=1.5, tid=1001,
+                trail_categories=["unclassified"]),
+            self._make_cluster_with_category(
+                48.1, 10.0, 48.103, 10.003, length_km=0.8, tid=1002,
+                trail_categories=["classified"]),
+        ]
+        wps = derive_routing_waypoints(cls, max_points=3)
+        # Classified cluster (0.8 km) gets pair first despite being shorter
+        assert len(wps) == 3
+        assert wps[0] == [48.1, 10.0]       # entry of classified cluster (shorter but higher priority)
+        assert wps[1] == [48.103, 10.003]    # exit of classified cluster
+        assert wps[2] == [48.003, 10.003]    # centroid of unclassified cluster (longer, lower priority)
+        # Verify first two points are the classified cluster
+        classified_entry = [48.1, 10.0]
+        classified_exit = [48.103, 10.003]
+        # Sort order: classified (0.8 km) → unclassified (1.5 km)
+        assert wps[0] == classified_entry
+        assert wps[1] == classified_exit
+
+    def test_three_tier_priority_order(self):
+        """Reihenfolge: classified > unclassified > andere (ohne Kategorie)."""
+        cls = [
+            self._make_cluster_with_category(
+                48.0, 10.0, 48.004, 10.004, length_km=2.0, tid=1001,
+                trail_categories=[]),  # 'other' — keine Kategorie
+        ]
+        cls[0]["way_types"] = ["way"]
+        cls.extend([
+            self._make_cluster_with_category(
+                48.1, 10.0, 48.104, 10.004, length_km=1.5, tid=1002,
+                trail_categories=["classified"]),
+            self._make_cluster_with_category(
+                48.2, 10.0, 48.204, 10.004, length_km=0.5, tid=1003,
+                trail_categories=["unclassified"]),
+        ])
+        wps = derive_routing_waypoints(cls, max_points=5)
+        # classified (1.5km, prio 0) → unclassified (0.5km, prio 1) → other (2.0km, prio 2)
+        assert len(wps) == 5
+        # Pair from classified cluster (priority 0)
+        assert wps[0] == [48.1, 10.0]
+        assert wps[1] == [48.104, 10.004]
+        # Pair from unclassified cluster (priority 1)
+        assert wps[2] == [48.2, 10.0]
+        assert wps[3] == [48.204, 10.004]
+        # Centroid from other category cluster (priority 2)
+        assert wps[4] == [48.002, 10.002]  # centroid of (48.0,10.0) (48.004,10.004)

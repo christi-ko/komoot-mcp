@@ -328,7 +328,10 @@ def derive_routing_waypoints(
     Strategy:
       1. Represent each trail cluster by its actual entry (start) and
          exit (end) coordinates rather than a synthetic centroid.
-      2. Sort clusters by total_length_km descending.
+      2. Sort clusters by trail category priority then length descending:
+         classified (trail_d1..trail_d5) first, unclassified (wt#trail)
+         second, other unpaved relevance third; within same category
+         longest first.
       3. For top-priority clusters allocate two waypoints (entry + exit).
          Lower-priority clusters get a single centroid point when budget
          no longer supports full pairs.
@@ -362,12 +365,34 @@ def derive_routing_waypoints(
             round((start["lat"] + end["lat"]) / 2, 6),
             round((start["lng"] + end["lng"]) / 2, 6),
         ]
+        trail_categories = cl.get("trail_categories", [])
+        way_types = cl.get("way_types", [])
+        # Explicit cluster categories take precedence over legacy way_types;
+        # otherwise infer the priority from concrete trail way types.
+        if "classified" in trail_categories:
+            trail_category_priority = 0
+        elif "unclassified" in trail_categories:
+            trail_category_priority = 1
+        elif any(
+            isinstance(wt, str)
+            and (wt.startswith("trail_d") or wt.startswith("wt#trail_d"))
+            for wt in way_types
+        ):
+            trail_category_priority = 0
+        elif any(
+            isinstance(wt, str)
+            and wt in {"trail_unclassified", "wt#trail"}
+            for wt in way_types
+        ):
+            trail_category_priority = 1
+        else:
+            trail_category_priority = 2
         cluster_data.append({
             "entry": entry,
             "exit": exit_pt,
             "centroid": centroid,
             "length_km": cl.get("total_length_km", 0),
-            "trail_category_priority": 0 if "classified" in cl.get("trail_categories", []) else 1,
+            "trail_category_priority": trail_category_priority,
         })
 
     if not cluster_data:

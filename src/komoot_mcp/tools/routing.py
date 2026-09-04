@@ -636,9 +636,8 @@ def _is_qualitatively_better(
     if a_remaining != b_remaining:
         return a_remaining < b_remaining
 
-    # E. Difficulty is considered only when an explicit maximum exists.
-    # Constraint violations were handled above; feasible routes are not
-    # ranked by T/C difficulty.
+    # E. No hidden T/C preference: an explicit maximum is a hard constraint
+    # handled above, not a reason to prefer a harder feasible route.
 
     # F. Lower overlap is a soft criterion only.
     a_overlap = _g(a.get("route_overlap") or {}, "overlap_percentage", 0)

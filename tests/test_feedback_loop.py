@@ -406,6 +406,170 @@ class TestIsQualitativelyBetter:
         assert _is_qualitatively_better(a, b) is True   # earlier wins
         assert _is_qualitatively_better(b, a) is False  # later loses
 
+    # ── Targeted tests per parent requirements ───────────────────────
+
+    def test_classified_beats_longer_unclassified_route(self):
+        """Classification beats longer but unclassified route."""
+        a = _make_compact_route(
+            distance_km=25.0,
+            trail_coverage_classified_covered=1,
+            trail_coverage_classified_pct=50.0,
+            trail_coverage_total_pct=50.0,
+        )
+        b = _make_compact_route(
+            distance_km=10.0,
+            trail_coverage_classified_covered=0,
+            trail_coverage_classified_pct=0.0,
+            trail_coverage_total_pct=30.0,
+        )
+        # a has classified coverage → beats b despite being longer
+        assert _is_qualitatively_better(a, b) is True
+        assert _is_qualitatively_better(b, a) is False
+
+
+    def test_covered_clusters_beat_shorter_distance(self):
+        """More covered classified clusters beat a shorter route with fewer."""
+        a = _make_compact_route(
+            distance_km=30.0,
+            trail_coverage_classified_covered=2,
+            trail_coverage_classified_pct=60.0,
+            trail_coverage_total_pct=60.0,
+            trail_clusters={
+                "covered": [_cluster_entry(0, 85.0, ["classified"]),
+                            _cluster_entry(1, 75.0, ["classified"])],
+                "partial": [],
+                "uncovered": [],
+            },
+        )
+        b = _make_compact_route(
+            distance_km=15.0,
+            trail_coverage_classified_covered=0,
+            trail_coverage_classified_pct=10.0,
+            trail_coverage_total_pct=10.0,
+            trail_clusters={
+                "covered": [],
+                "partial": [_cluster_entry(0, 30.0, ["classified"])],
+                "uncovered": [_cluster_entry(1, 5.0, ["classified"])],
+            },
+        )
+        assert _is_qualitatively_better(a, b) is True
+        assert _is_qualitatively_better(b, a) is False
+
+    def test_technical_difficulty_not_compared_without_explicit_max(self):
+        """T diff is irrelevant when no explicit max constraint exists."""
+        a = _make_compact_route()
+        b = _make_compact_route()
+        a["technical_difficulty"] = "T3"
+        b["technical_difficulty"] = "T1"
+        a["_attempt"], b["_attempt"] = 1, 2
+        # T3 vs T1, but no max constraint → earlier attempt wins
+        assert _is_qualitatively_better(a, b) is True  # earlier
+        assert _is_qualitatively_better(b, a) is False
+
+    def test_approach_return_overlap_allowed(self):
+        """Approach/return overlap (≤25%) does not disqualify a route."""
+        # Both have same classified coverage, same distance
+        # a has 0% overlap, b has 20% approach/return overlap
+        tc_covered = {
+            "covered": [_cluster_entry(0, 85.0, ["classified"])],
+            "partial": [], "uncovered": [],
+        }
+        a = _make_compact_route(
+            distance_km=20.0,
+            overlap_pct=0.0,
+            trail_coverage_classified_covered=1,
+            trail_coverage_classified_pct=85.0,
+            trail_coverage_total_pct=85.0,
+            trail_clusters=tc_covered,
+        )
+        b = _make_compact_route(
+            distance_km=20.0,
+            overlap_pct=20.0,  # approach/return overlap
+            trail_coverage_classified_covered=1,
+            trail_coverage_classified_pct=85.0,
+            trail_coverage_total_pct=85.0,
+            trail_clusters=tc_covered,
+        )
+        a["_attempt"], b["_attempt"] = 1, 2
+        # Same trail coverage, distance — overlap gap 20% > 5% → a wins
+        assert _is_qualitatively_better(a, b) is True
+        # But b is not categorically excluded — if b has better trail
+        # COVERAGE (higher priority criterion), it wins despite overlap
+        b2 = _make_compact_route(
+            distance_km=22.0,
+            overlap_pct=20.0,
+            singletrail_km=3.5,
+            trail_coverage_classified_covered=2,
+            trail_coverage_classified_pct=90.0,
+            trail_coverage_total_pct=90.0,
+            trail_clusters={
+                "covered": [_cluster_entry(0, 95.0, ["classified"]),
+                            _cluster_entry(1, 85.0, ["classified"])],
+                "partial": [], "uncovered": [],
+            },
+        )
+        b2["_attempt"] = 2
+        # b2 has more covered classified clusters (2 vs 1) → beats a despite overlap
+        assert _is_qualitatively_better(b2, a) is True
+
+    def test_asphalt_does_not_beat_better_trail_route(self):
+        """Asphalt is last criterion and cannot override trail coverage."""
+        a = _make_compact_route(
+            asphalt_pct=80.0,
+            singletrail_km=8.0,
+            trail_coverage_classified_covered=1,
+            trail_coverage_classified_pct=80.0,
+            trail_coverage_total_pct=80.0,
+            trail_clusters={
+                "covered": [_cluster_entry(0, 85.0, ["classified"])],
+                "partial": [], "uncovered": [],
+            },
+        )
+        b = _make_compact_route(
+            asphalt_pct=5.0,
+            singletrail_km=1.0,
+            trail_coverage_classified_covered=0,
+            trail_coverage_classified_pct=10.0,
+            trail_coverage_total_pct=10.0,
+            trail_clusters={},
+        )
+        # a has 80% asphalt but much better trail → a wins
+        assert _is_qualitatively_better(a, b) is True
+        assert _is_qualitatively_better(b, a) is False
+
+    def test_lower_elevation_not_always_better_if_trail_lost(self):
+        """Weniger Höhenmeter sind nicht besser, wenn dafür Trail verloren geht."""
+        # Same cluster structure, but a loses a classified covered cluster vs b
+        tc_a = {
+            "covered": [_cluster_entry(0, 85.0, ["classified"])],
+            "partial": [], "uncovered": [_cluster_entry(1, 5.0, ["classified"])],
+        }
+        tc_b = {
+            "covered": [_cluster_entry(0, 85.0, ["classified"]),
+                        _cluster_entry(1, 88.0, ["classified"])],
+            "partial": [], "uncovered": [],
+        }
+        a = _make_compact_route(
+            distance_km=18.0,
+            trail_coverage_classified_covered=1,
+            trail_coverage_classified_pct=45.0,
+            trail_coverage_total_pct=45.0,
+            trail_clusters=tc_a,
+        )
+        a["elevation_up_m"] = 300.0
+        b = _make_compact_route(
+            distance_km=25.0,
+            trail_coverage_classified_covered=2,
+            trail_coverage_classified_pct=86.0,
+            trail_coverage_total_pct=86.0,
+            trail_clusters=tc_b,
+        )
+        b["elevation_up_m"] = 800.0
+        a["_attempt"], b["_attempt"] = 1, 2
+        # b has more covered clusters (2 vs 1) → b wins despite more HM
+        assert _is_qualitatively_better(b, a) is True
+        assert _is_qualitatively_better(a, b) is False
+
 
 class TestFeedbackIterationSummary:
     """_feedback_iteration_summary"""
