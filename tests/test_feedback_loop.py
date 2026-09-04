@@ -111,15 +111,18 @@ class MockPlanRoute:
         compact=True,
         discovered_segments=None,
         discovered_clusters=None,
+        **kwargs,
     ):
         self.call_count += 1
         idx = min(self.call_count - 1, len(self.responses) - 1)
         resp = {k: v for k, v in self.responses[idx].items()}
-        self.call_history.append({
+        record = {
             "coordinates": [list(c) for c in coordinates],
             "sport": sport,
             "waypoint_count": len(coordinates),
-        })
+            "kwargs": dict(kwargs),
+        }
+        self.call_history.append(record)
         return resp
 
 
@@ -992,6 +995,176 @@ class TestRunFeedbackLoop:
                 for c in two_classified_clusters
             )
             assert near_cluster, f"Waypoint {wp} is not from any cluster entry/exit"
+
+    def test_constraints_not_required(self, two_classified_clusters, dummy_segments):
+        """Old call without constraints works — no selection_constraints needed."""
+        tc = {
+            "covered": [_cluster_entry(0, 85.0, ["classified"]),
+                        _cluster_entry(1, 90.0, ["classified"])],
+            "partial": [],
+            "uncovered": [],
+        }
+        route1 = _make_compact_route(
+            trail_coverage_classified_covered=2,
+            trail_coverage_classified_pct=87.0,
+            trail_coverage_total_pct=87.0,
+            trail_clusters=tc,
+        )
+        mock = MockPlanRoute([route1])
+        result = asyncio.run(_run_feedback_loop(
+            self.INITIAL_COORDS, "mtb", dummy_segments, two_classified_clusters,
+            mock, max_iterations=3,
+        ))
+        assert result["status"] == "feedback_complete"
+        assert mock.call_count == 1
+
+
+class TestIsQualitativelyBetterDistanceConstraints:
+    """_is_qualitatively_better with distance constraints (min_distance_km, max_distance_km)."""
+
+    def _with_sc(self, route, constraints):
+        """Attach selection_constraints to a route copy."""
+        r = dict(route)
+        r["selection_constraints"] = constraints
+        r["_attempt"] = r.get("_attempt", 1)
+        return r
+
+    # ── In-range beats out-of-range ────────────────────────────────
+
+    def test_min_distance_prefers_feasible_over_violation(self):
+        """With min=35, 36km (feasible) beats 34km (violation)."""
+        a = _make_compact_route(distance_km=36.0)
+        b = _make_compact_route(distance_km=34.0)
+        a = self._with_sc(a, {"min_distance_km": 35})
+        b = self._with_sc(b, {"min_distance_km": 35})
+        assert _is_qualitatively_better(a, b) is True
+
+    def test_max_distance_prefers_feasible_over_violation(self):
+        """With max=40, 39km (feasible) beats 41km (violation)."""
+        a = _make_compact_route(distance_km=39.0)
+        b = _make_compact_route(distance_km=41.0)
+        a = self._with_sc(a, {"max_distance_km": 40})
+        b = self._with_sc(b, {"max_distance_km": 40})
+        assert _is_qualitatively_better(a, b) is True
+
+    def test_min_distance_violation_loses_to_any_feasible(self):
+        """34km (violation with min=35) loses to 37km (feasible)."""
+        a = _make_compact_route(distance_km=23.75)
+        b = _make_compact_route(distance_km=37.0)
+        a = self._with_sc(a, {"min_distance_km": 35, "max_distance_km": 40})
+        b = self._with_sc(b, {"min_distance_km": 35, "max_distance_km": 40})
+        assert _is_qualitatively_better(a, b) is False
+        assert _is_qualitatively_better(b, a) is True
+
+    # ── Both in-range: distance does NOT decide ─────────────────────
+
+    def test_both_in_range_shorter_not_preferred_by_distance(self):
+        """With min=35, max=40, 36km does NOT beat 38km just because shorter."""
+        a = _make_compact_route(distance_km=36.0)
+        b = _make_compact_route(distance_km=38.0)
+        a = self._with_sc(a, {"min_distance_km": 35, "max_distance_km": 40})
+        b = self._with_sc(b, {"min_distance_km": 35, "max_distance_km": 40})
+        # Both in-range, same coverage — earlier attempt wins
+        a["_attempt"] = 1
+        b["_attempt"] = 2
+        assert _is_qualitatively_better(a, b) is True  # earlier
+
+    def test_both_in_range_trail_coverage_still_decides(self):
+        """Trail coverage still beats distance when both in-range."""
+        a = _make_compact_route(
+            distance_km=38.0,
+            trail_coverage_classified_covered=2, trail_coverage_classified_pct=80.0,
+            trail_coverage_total_pct=80.0,
+            trail_clusters={
+                "covered": [_cluster_entry(0, 85.0, ["classified"]),
+                            _cluster_entry(1, 75.0, ["classified"])],
+                "partial": [], "uncovered": [],
+            },
+        )
+        b = _make_compact_route(
+            distance_km=36.0,
+            trail_coverage_classified_covered=0, trail_coverage_classified_pct=10.0,
+            trail_coverage_total_pct=10.0,
+        )
+        a = self._with_sc(a, {"min_distance_km": 35, "max_distance_km": 40})
+        b = self._with_sc(b, {"min_distance_km": 35, "max_distance_km": 40})
+        assert _is_qualitatively_better(a, b) is True
+
+    # ── Both out-of-range: closer to range wins ────────────────────
+
+    def test_both_out_of_range_closer_wins(self):
+        """With 35..40, 34km (excess 1) beats 30km (excess 5)."""
+        a = _make_compact_route(distance_km=34.0)
+        b = _make_compact_route(distance_km=30.0)
+        a = self._with_sc(a, {"min_distance_km": 35, "max_distance_km": 40})
+        b = self._with_sc(b, {"min_distance_km": 35, "max_distance_km": 40})
+        assert _is_qualitatively_better(a, b) is True
+
+    def test_both_too_long_closer_wins(self):
+        """With 35..40, 41km beats 45km."""
+        a = _make_compact_route(distance_km=41.0)
+        b = _make_compact_route(distance_km=45.0)
+        a = self._with_sc(a, {"min_distance_km": 35, "max_distance_km": 40})
+        b = self._with_sc(b, {"min_distance_km": 35, "max_distance_km": 40})
+        assert _is_qualitatively_better(a, b) is True
+
+    # ── Without constraints: old behavior preserved ────────────────
+
+    def test_no_constraints_shorter_wins_old_behavior(self):
+        """Without distance constraints, 30km beats 40km (diff > 2km − shorter wins)."""
+        a = _make_compact_route(distance_km=30.0)
+        b = _make_compact_route(distance_km=40.0)
+        a["_attempt"], b["_attempt"] = 2, 1
+        assert _is_qualitatively_better(a, b) is True
+
+    # ── Only one constraint bound ──────────────────────────────────
+
+    def test_min_only_feasible_wins(self):
+        """Only min=35: 36 (feasible) beats 34 (violation)."""
+        a = _make_compact_route(distance_km=36.0)
+        b = _make_compact_route(distance_km=34.0)
+        a = self._with_sc(a, {"min_distance_km": 35})
+        b = self._with_sc(b, {"min_distance_km": 35})
+        assert _is_qualitatively_better(a, b) is True
+
+    def test_max_only_feasible_wins(self):
+        """Only max=40: 39 (feasible) beats 41 (violation)."""
+        a = _make_compact_route(distance_km=39.0)
+        b = _make_compact_route(distance_km=41.0)
+        a = self._with_sc(a, {"max_distance_km": 40})
+        b = self._with_sc(b, {"max_distance_km": 40})
+        assert _is_qualitatively_better(a, b) is True
+
+
+class TestRunFeedbackLoopConstraints:
+    """_run_feedback_loop with constraint parameters."""
+
+    INITIAL_COORDS = [[47.5, 10.0], [47.6, 10.1]]
+
+    def test_constraints_attached_to_each_iteration(self, dummy_segments, two_classified_clusters):
+        """Constraints dict is passed to plan_route_fn and recorded in call history."""
+        tc = {
+            "covered": [],
+            "partial": [],
+            "uncovered": [_cluster_entry(0, 3.0, ["classified"]),
+                          _cluster_entry(1, 2.0, ["classified"])],
+        }
+        route = _make_compact_route(trail_clusters=tc)
+        mock = MockPlanRoute([route, route, route])
+
+        from komoot_mcp.tools.routing import _run_feedback_loop as fb
+        result = asyncio.run(fb(
+            self.INITIAL_COORDS, "mtb",
+            dummy_segments, two_classified_clusters, mock,
+            max_iterations=3,
+            selection_constraints={"min_distance_km": 35, "max_distance_km": 40},
+        ))
+
+        for rec in mock.call_history:
+            kwargs = rec.get("kwargs", {})
+            assert kwargs.get("min_distance_km") == 35
+            assert kwargs.get("max_distance_km") == 40
+            assert mock.call_count <= 3
 
 
 # ══════════════════════════════════════════════════════════════════════

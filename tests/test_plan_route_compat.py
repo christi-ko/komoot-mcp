@@ -564,3 +564,76 @@ def test_plan_route_compact_false_response_size(
     ref = result["route_ref"]
     cached_size = len(json.dumps(routing._route_cache[ref][1]).encode("utf-8"))
     assert cached_size > 40000, f"cached route is {cached_size} bytes — expected > 40 KB"
+
+
+# ── New constraint params backward compatibility ────────────────────────
+
+
+class TestPlanRouteNewParamsBackwardCompat:
+    """Old-style calls must produce same results with new parameters available."""
+
+    def test_old_call_minimal(self, registered):
+        """Minimal old call: only coordinates."""
+        mcp, _client = registered
+        plan_route = mcp.tools["plan_route"]
+        result = _run(plan_route(COORDS, sport="hike"))
+        assert "distance_km" in result or "route_ref" in result
+        assert "error" not in result
+
+    def test_old_call_compact_false(self, registered):
+        """Old-style compact=False call."""
+        mcp, _client = registered
+        plan_route = mcp.tools["plan_route"]
+        result = _run(plan_route(COORDS, sport="mtb", compact=False))
+        assert "route_ref" in result
+        assert result["route_ref"].startswith("route_")
+
+    def test_old_call_compact_true(self, registered):
+        """Old-style compact=True call."""
+        mcp, _client = registered
+        plan_route = mcp.tools["plan_route"]
+        result = _run(plan_route(COORDS, sport="mtb", compact=True))
+        assert "route_ref" not in result
+        assert result["distance_km"] > 0
+
+    def test_new_params_default_none(self, registered):
+        """New params default to None and old calls ignore them."""
+        mcp, _client = registered
+        plan_route = mcp.tools["plan_route"]
+        result = _run(plan_route(
+            COORDS, sport="mtb", compact=True,
+            min_distance_km=None, max_distance_km=None,
+            max_elevation_up_m=None, technical_max=None,
+        ))
+        assert result["distance_km"] > 0
+
+    def test_new_params_provided_compact_true(self, registered):
+        """New params accepted with compact=True, no error."""
+        mcp, _client = registered
+        plan_route = mcp.tools["plan_route"]
+        result = _run(plan_route(
+            COORDS, sport="mtb", compact=True,
+            min_distance_km=20.0, max_distance_km=50.0,
+            max_elevation_up_m=800.0, technical_max="T3",
+        ))
+        assert result["distance_km"] > 0
+
+    def test_new_params_provided_compact_false(self, registered):
+        """New params accepted with compact=False, no error."""
+        mcp, _client = registered
+        plan_route = mcp.tools["plan_route"]
+        result = _run(plan_route(
+            COORDS, sport="mtb", compact=False,
+            min_distance_km=10.0, max_distance_km=100.0,
+            max_elevation_up_m=500.0, technical_max="T4",
+        ))
+        assert "route_ref" in result
+        assert result["route_ref"].startswith("route_")
+
+    def test_feedback_loop_false_default_no_change(self, registered):
+        """feedback_loop=False (default) — normal routing unchanged."""
+        mcp, _client = registered
+        plan_route = mcp.tools["plan_route"]
+        result = _run(plan_route(COORDS, sport="mtb", compact=True))
+        assert "iterations" not in result
+        assert "best_route" not in result

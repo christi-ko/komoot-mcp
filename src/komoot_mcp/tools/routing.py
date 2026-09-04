@@ -596,6 +596,18 @@ def _is_qualitatively_better(
             if elevation > elevation_max:
                 violations += 1
                 excess += elevation - elevation_max
+
+        min_distance = constraints.get("min_distance_km")
+        max_distance = constraints.get("max_distance_km")
+        distance = route.get("distance_km")
+        if isinstance(distance, (int, float)):
+            if isinstance(min_distance, (int, float)) and distance < min_distance:
+                violations += 1
+                excess += min_distance - distance
+            if isinstance(max_distance, (int, float)) and distance > max_distance:
+                violations += 1
+                excess += distance - max_distance
+
         return violations, excess
 
     a_hard = _constraint_status(a)
@@ -653,10 +665,70 @@ def _is_qualitatively_better(
 
     # H. Distance is the final route-size criterion. Elevation is not an
     # optimization target without an explicit constraint.
-    a_d = _g(a, "distance_km", 0)
-    b_d = _g(b, "distance_km", 0)
-    if abs(a_d - b_d) > 2:
-        return a_d < b_d
+    # When explicit distance bounds exist and both routes are in-range,
+    # distance is neutral (do not prefer shorter over longer).
+    a_constraints = a.get("selection_constraints") or {}
+    b_constraints = b.get("selection_constraints") or {}
+    has_distance_bounds = bool(
+        a_constraints.get("min_distance_km") is not None
+        or a_constraints.get("max_distance_km") is not None
+        or b_constraints.get("min_distance_km") is not None
+        or b_constraints.get("max_distance_km") is not None
+    )
+    if has_distance_bounds:
+        # Check if both are in-range wrt their own constraints
+        def _in_range(route: dict[str, Any]) -> bool:
+            c = route.get("selection_constraints") or {}
+            d = route.get("distance_km")
+            if not isinstance(d, (int, float)):
+                return True
+            min_d = c.get("min_distance_km")
+            max_d = c.get("max_distance_km")
+            if isinstance(min_d, (int, float)) and d < min_d:
+                return False
+            if isinstance(max_d, (int, float)) and d > max_d:
+                return False
+            return True
+
+        a_in_range = _in_range(a)
+        b_in_range = _in_range(b)
+        if a_in_range and b_in_range:
+            # Both in-range: distance is neutral, fall through to I
+            pass
+        else:
+            # Neither route is necessarily feasible. Compare distance to
+            # the nearest bound, not raw route length: for two routes below
+            # min, the longer route is closer; for two above max, shorter is
+            # closer. If only one bound exists, use its violation distance.
+            def _distance_to_range(route: dict[str, Any]) -> float:
+                c = route.get("selection_constraints") or {}
+                d = route.get("distance_km")
+                if not isinstance(d, (int, float)):
+                    return float("inf")
+                min_d = c.get("min_distance_km")
+                max_d = c.get("max_distance_km")
+                distances = []
+                if isinstance(min_d, (int, float)) and d < min_d:
+                    distances.append(min_d - d)
+                if isinstance(max_d, (int, float)) and d > max_d:
+                    distances.append(d - max_d)
+                return min(distances, default=0.0)
+
+            a_gap = _distance_to_range(a)
+            b_gap = _distance_to_range(b)
+            if a_gap != b_gap:
+                return a_gap < b_gap
+            # Equal violation distance: preserve the historical tie behavior.
+            a_d = _g(a, "distance_km", 0)
+            b_d = _g(b, "distance_km", 0)
+            if abs(a_d - b_d) > 2:
+                return a_d < b_d
+    else:
+        # No explicit distance bounds — old behavior: shorter preferred
+        a_d = _g(a, "distance_km", 0)
+        b_d = _g(b, "distance_km", 0)
+        if abs(a_d - b_d) > 2:
+            return a_d < b_d
 
     # I. Asphalt is last and cannot displace a materially better trail route.
     a_asp = _g(a.get("surfaces") or {}, "asphalt", 0)
@@ -740,6 +812,7 @@ async def _run_feedback_loop(
     discovered_clusters: list[dict[str, Any]],
     plan_route_fn: Any,
     max_iterations: int = 3,
+    selection_constraints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run up to *max_iterations* routing attempts with coverage-guided tuning.
 
@@ -767,6 +840,9 @@ async def _run_feedback_loop(
         discovered_clusters: Trail clusters from cluster_trail_segments().
         plan_route_fn: Async callable matching plan_route(..., compact=True).
         max_iterations: Maximum routing attempts (default 3, min 1).
+        selection_constraints: Optional dict of hard constraint limits
+            (min_distance_km, max_distance_km, max_elevation_up_m,
+             technical_max) used in qualitative comparison.
 
     Returns:
         Dict with:
@@ -790,14 +866,28 @@ async def _run_feedback_loop(
 
     for attempt in range(1, max_iterations + 1):
         # ── Route ────────────────────────────────────────────────
-        route = await plan_route_fn(
-            current_coords,
+        kwargs: dict[str, Any] = dict(
             sport=sport,
             compact=True,
             discovered_segments=discovered_segments,
             discovered_clusters=discovered_clusters,
         )
+        if selection_constraints:
+            # Forward the public plan_route parameters, not the internal
+            # comparison dictionary. This keeps recursive real calls
+            # signature-compatible while preserving the internal metadata.
+            for key in (
+                "min_distance_km",
+                "max_distance_km",
+                "max_elevation_up_m",
+                "technical_max",
+            ):
+                if key in selection_constraints:
+                    kwargs[key] = selection_constraints[key]
+        route = await plan_route_fn(current_coords, **kwargs)
         route["_attempt"] = attempt
+        if selection_constraints is not None:
+            route["selection_constraints"] = dict(selection_constraints)
         route["_waypoints"] = [list(c) for c in current_coords]
         raw_iterations.append(route)
 
@@ -1459,6 +1549,10 @@ def register(mcp, client: KomootClient) -> None:
         discovered_segments: list[dict[str, Any]] | None = None,
         discovered_clusters: list[dict[str, Any]] | None = None,
         feedback_loop: bool = False,
+        min_distance_km: float | None = None,
+        max_distance_km: float | None = None,
+        max_elevation_up_m: float | None = None,
+        technical_max: str | None = None,
     ) -> dict[str, Any]:
         """Planifier un itineraire Komoot a partir de waypoints.
 
@@ -1481,7 +1575,25 @@ def register(mcp, client: KomootClient) -> None:
             feedback_loop: si True, lance une optimisation iterative avec jusqu'a
                            3 tentatives de routage guidees par trail_coverage.
                            Necessite discovered_segments. Defaut: False.
+            min_distance_km: Distance minimale souhaitee (hard constraint
+                             de selection, pas de routage Komoot).
+            max_distance_km: Distance maximale souhaitee (hard constraint
+                             de selection, pas de routage Komoot).
+            max_elevation_up_m: Denivele max (hard constraint de selection).
+            technical_max: Difficulté technique max ex. 'T2' (hard constraint
+                           de selection).
         """
+        # ── Build selection_constraints dict ─────────────────────
+        selection_constraints: dict[str, Any] = {}
+        if min_distance_km is not None:
+            selection_constraints["min_distance_km"] = min_distance_km
+        if max_distance_km is not None:
+            selection_constraints["max_distance_km"] = max_distance_km
+        if max_elevation_up_m is not None:
+            selection_constraints["max_elevation_up_m"] = max_elevation_up_m
+        if technical_max is not None:
+            selection_constraints["technical_max"] = technical_max
+
         # ── Feedback loop mode ────────────────────────────────────
         if feedback_loop:
             return await _run_feedback_loop(
@@ -1490,6 +1602,7 @@ def register(mcp, client: KomootClient) -> None:
                 discovered_clusters or [],
                 plan_route,
                 max_iterations=3,
+                selection_constraints=selection_constraints if selection_constraints else None,
             )
 
         # Build path (indexed waypoints) and segments (Routed geometry between consecutive points)
