@@ -143,6 +143,22 @@ def test_surfaces_structure() -> None:
     assert sfs["asphalt"]["percentage"] == 6.3
 
 
+def test_route_quality_metrics_separate_trail_coverage_and_offroad() -> None:
+    raw = _make_raw()
+    raw["summary"]["surfaces"].extend([
+        {"type": "sm#unpaved", "amount": 0.1},
+        {"type": "sm#nature", "amount": 0.2},
+    ])
+    result = _compact_route_summary(raw)
+    metrics = result["route_quality_metrics"]
+    assert metrics["asphalt_km"] == 2.1
+    assert metrics["surface_offroad_km"] == 27.72
+    assert metrics["surface_offroad_percentage"] == 83.0
+    assert metrics["classified_trail_km"] > 0
+    assert "discovery_trail_coverage" not in metrics
+    assert metrics["classified_trail_percentage"] == result["singletrail"]["singletrail_percentage"]
+
+
 # ── Singletrail ────────────────────────────────────────────────────────
 
 def test_singletrail_present() -> None:

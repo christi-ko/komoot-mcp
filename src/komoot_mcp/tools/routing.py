@@ -7,6 +7,7 @@ Inspires du projet export-komoot (Go) de pieterclaerhout.
 from __future__ import annotations
 
 import asyncio
+from itertools import combinations
 import math
 import time
 from typing import Any, Optional
@@ -19,6 +20,58 @@ from ..client import KomootClient, KomootError
 _route_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _route_cache_lock = asyncio.Lock()
 _CACHE_TTL = 3600  # 1 hour
+
+# Candidate geometry validity thresholds. 96% is redundant; 90-96% is
+# retained as a warning so the controller can still compare a viable route.
+ROUTE_REDUNDANCY_OVERLAP_PCT = 96.0
+ROUTE_SIMILARITY_WARNING_PCT = 90.0
+MAX_ADAPTIVE_ROUTING_CALLS = 5
+
+
+ROUTE_SAMPLE_STEP_KM = 0.10
+ROUTE_SIMILARITY_RADIUS_KM = 0.025
+
+
+def _route_geometry_fingerprint(coord_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compactly represent a route by distance-normalized geometry samples."""
+    points: list[tuple[float, float]] = []
+    for item in coord_items:
+        try:
+            lat, lng = item.get("lat"), item.get("lng")
+            if lat is not None and lng is not None:
+                points.append((float(lat), float(lng)))
+        except (TypeError, ValueError):
+            continue
+    if len(points) < 2:
+        return {"hash": "", "samples": []}
+    lengths = [0.0]
+    for a, b in zip(points, points[1:]):
+        lengths.append(lengths[-1] + _haversine_km(a[0], a[1], b[0], b[1]))
+    total = lengths[-1]
+    targets = [i * ROUTE_SAMPLE_STEP_KM for i in range(int(total / ROUTE_SAMPLE_STEP_KM) + 1)]
+    if not targets or targets[-1] < total:
+        targets.append(total)
+    samples: list[tuple[float, float]] = []
+    for target in targets:
+        i = next((j for j in range(1, len(lengths)) if lengths[j] >= target), len(lengths) - 1)
+        span = lengths[i] - lengths[i - 1]
+        ratio = (target - lengths[i - 1]) / span if span else 0.0
+        lat = points[i - 1][0] + ratio * (points[i][0] - points[i - 1][0])
+        lng = points[i - 1][1] + ratio * (points[i][1] - points[i - 1][1])
+        samples.append((round(lat, 6), round(lng, 6)))
+    import hashlib
+    payload = ";".join(f"{lat:.6f},{lng:.6f}" for lat, lng in samples)
+    return {"hash": hashlib.sha256(payload.encode()).hexdigest(), "samples": samples, "length_km": round(total, 4)}
+
+
+def _geometry_similarity_pct(a: dict[str, Any], b: dict[str, Any]) -> float:
+    """Symmetric distance-normalized similarity, independent of direction."""
+    ap, bp = a.get("samples", []), b.get("samples", [])
+    if not ap or not bp:
+        return 0.0
+    def coverage(source: list[tuple[float, float]], target: list[tuple[float, float]]) -> float:
+        return sum(any(_haversine_km(x, y, u, v) <= ROUTE_SIMILARITY_RADIUS_KM for u, v in target) for x, y in source) / len(source)
+    return round((coverage(ap, bp) + coverage(bp, ap)) * 50.0, 1)
 
 
 # ── Route overlap detection ──────────────────────────────────────────
@@ -679,17 +732,6 @@ def _is_qualitatively_better(
                 violations += 1
                 excess += elevation - elevation_max
 
-        min_distance = constraints.get("min_distance_km")
-        max_distance = constraints.get("max_distance_km")
-        distance = route.get("distance_km")
-        if isinstance(distance, (int, float)):
-            if isinstance(min_distance, (int, float)) and distance < min_distance:
-                violations += 1
-                excess += min_distance - distance
-            if isinstance(max_distance, (int, float)) and distance > max_distance:
-                violations += 1
-                excess += distance - max_distance
-
         return violations, excess
 
     a_hard = _constraint_status(a)
@@ -702,13 +744,21 @@ def _is_qualitatively_better(
     a_cls = a_cov.get("classified") or {}
     b_cls = b_cov.get("classified") or {}
 
-    # B. More desired classified clusters fully covered.
+    # B. Actual routed classified trail is the primary quality signal.
+    # Discovery coverage is a means of finding promising trail areas; it
+    # must not outrank trail that is actually present in the route.
+    a_st = _g(a.get("singletrail") or {}, "singletrail_total_km", 0)
+    b_st = _g(b.get("singletrail") or {}, "singletrail_total_km", 0)
+    a_q = _g(a.get("route_quality_metrics") or {}, "classified_trail_km", a_st)
+    b_q = _g(b.get("route_quality_metrics") or {}, "classified_trail_km", b_st)
+    if abs(a_q - b_q) > 0.5:
+        return a_q > b_q
+
+    # C. Discovery coverage is a tie-break between comparable routes.
     a_cc = _g(a_cls, "covered", 0)
     b_cc = _g(b_cls, "covered", 0)
     if a_cc != b_cc:
         return a_cc > b_cc
-
-    # C. Higher classified trail coverage.
     a_cp = _g(a_cls, "coverage_percentage", 0)
     b_cp = _g(b_cls, "coverage_percentage", 0)
     if abs(a_cp - b_cp) > 5:
@@ -739,14 +789,15 @@ def _is_qualitatively_better(
     if abs(a_overlap - b_overlap) > 5:
         return a_overlap < b_overlap
 
-    # G. Classified singletrail / trail quality.
-    a_st = _g(a.get("singletrail") or {}, "singletrail_total_km", 0)
-    b_st = _g(b.get("singletrail") or {}, "singletrail_total_km", 0)
-    if abs(a_st - b_st) > 0.5:
-        return a_st > b_st
+    # G. Surface offroad is the next quality criterion. Keep it distinct
+    # from classified trail: it is supportive terrain evidence, not trail.
+    a_off = _g(a.get("route_quality_metrics") or {}, "surface_offroad_km", 0)
+    b_off = _g(b.get("route_quality_metrics") or {}, "surface_offroad_km", 0)
+    if abs(a_off - b_off) > 0.5:
+        return a_off > b_off
 
-    # H. Distance is the final route-size criterion. Elevation is not an
-    # optimization target without an explicit constraint.
+    # H. Distance is soft: after trail quality, prefer an in-range route.
+    # Distance does not participate in hard-constraint violations.
     # When explicit distance bounds exist and both routes are in-range,
     # distance is neutral (do not prefer shorter over longer).
     a_constraints = a.get("selection_constraints") or {}
@@ -883,8 +934,273 @@ def _feedback_iteration_summary(
             summary["singletrail"] = st_compact
     if "way_types" in iteration:
         summary["way_types"] = iteration["way_types"]
+    if "route_quality_metrics" in iteration:
+        summary["route_quality_metrics"] = iteration["route_quality_metrics"]
+    for key in ("variant_id", "strategy", "selected_cluster_ids", "candidate_status",
+                "route_fingerprint", "geometry_similarity", "variant_specific_waypoints"):
+        if key in iteration:
+            summary[key] = iteration[key]
 
     return summary
+
+
+def _candidate_waypoint_signature(cluster_ids: list[int], waypoints: list[list[float]]) -> tuple:
+    return (
+        tuple(sorted(cluster_ids)),
+        tuple(sorted((round(float(p[0]), 6), round(float(p[1]), 6)) for p in waypoints)),
+    )
+
+
+def _route_metrics(route: dict[str, Any]) -> dict[str, float]:
+    q = route.get("route_quality_metrics") or {}
+    cov = (route.get("trail_coverage") or {}).get("classified") or {}
+    return {
+        "covered_clusters": float(cov.get("covered", 0)),
+        "discovery_coverage": float(cov.get("coverage_percentage", 0)),
+        "classified_trail_km": float(q.get(
+            "classified_trail_km",
+            (route.get("singletrail") or {}).get("singletrail_total_km", 0),
+        )),
+        "surface_offroad_km": float(q.get("surface_offroad_km", 0)),
+        "asphalt_percentage": float(q.get("asphalt_percentage", 0)),
+        "distance_km": float(route.get("distance_km", 0) or 0),
+    }
+
+
+def _adaptive_hard_violations(route: dict[str, Any], constraints: dict[str, Any]) -> int:
+    violations = 0
+    elevation = route.get("elevation_up_m")
+    if isinstance(elevation, (int, float)) and isinstance(constraints.get("max_elevation_up_m"), (int, float)):
+        violations += int(elevation > constraints["max_elevation_up_m"])
+    tech = route.get("technical_difficulty")
+    limit = constraints.get("technical_max")
+    if isinstance(tech, str) and isinstance(limit, str) and tech.startswith("T") and limit.startswith("T"):
+        try:
+            violations += int(int(tech[1:]) > int(limit[1:]))
+        except ValueError:
+            pass
+    return violations
+
+
+def _adaptive_route_better(a: dict[str, Any], b: dict[str, Any], constraints: dict[str, Any]) -> bool:
+    ah, bh = _adaptive_hard_violations(a, constraints), _adaptive_hard_violations(b, constraints)
+    if ah != bh:
+        return ah < bh
+    am, bm = _route_metrics(a), _route_metrics(b)
+    # Routed classified trail is the quality objective. Discovery coverage
+    # only describes how much of the known candidate pool was reached.
+    for key in ("classified_trail_km", "surface_offroad_km", "discovery_coverage", "covered_clusters"):
+        if am[key] != bm[key]:
+            return am[key] > bm[key]
+    amin, amax = constraints.get("min_distance_km"), constraints.get("max_distance_km")
+    if amin is None and amax is None:
+        if am["asphalt_percentage"] != bm["asphalt_percentage"]:
+            return am["asphalt_percentage"] < bm["asphalt_percentage"]
+        return int(a.get("_attempt", 999)) < int(b.get("_attempt", 999))
+    def distance_key(d: float) -> tuple[int, float]:
+        min_value = float(amin) if isinstance(amin, (int, float)) else None
+        max_value = float(amax) if isinstance(amax, (int, float)) else None
+        if min_value is not None and d < min_value:
+            return (1, min_value - d)
+        if max_value is not None and d > max_value:
+            return (1, d - max_value)
+        return (0, 0.0)
+    ad, bd = distance_key(am["distance_km"]), distance_key(bm["distance_km"])
+    if ad != bd:
+        return ad < bd
+    if am["asphalt_percentage"] != bm["asphalt_percentage"]:
+        return am["asphalt_percentage"] < bm["asphalt_percentage"]
+    return int(a.get("_attempt", 999)) < int(b.get("_attempt", 999))
+
+
+def _adaptive_strategy_order(route: dict[str, Any], tested: set[str]) -> list[str]:
+    base = ["classified_trail_coverage", "spatial_trail_diversity", "distance_aware", "balanced"]
+    if _distance_strategy_needed(route) and "distance_aware" in base:
+        base.remove("distance_aware")
+        base.insert(0, "distance_aware")
+    return [strategy for strategy in base if strategy not in tested]
+
+
+def _build_feedback_transition(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "from_variant_id": previous.get("variant_id"),
+        "to_variant_id": current.get("variant_id"),
+        "distance_delta_km": round(float(current.get("distance_km", 0)) - float(previous.get("distance_km", 0)), 3),
+        "classified_trail_delta_km": round(
+            float((current.get("route_quality_metrics") or {}).get("classified_trail_km", 0))
+            - float((previous.get("route_quality_metrics") or {}).get("classified_trail_km", 0)), 3,
+        ),
+    }
+
+
+def _adaptive_has_meaningful_next_strategy(
+    route: dict[str, Any],
+    tested_strategies: set[str],
+    constraints: dict[str, Any],
+) -> bool:
+    """Decide whether another attempt has a concrete, untested purpose."""
+    if _distance_strategy_needed({**route, "selection_constraints": constraints}) and "distance_aware" not in tested_strategies:
+        return True
+    clusters = route.get("trail_clusters") or {}
+    remaining = [
+        c for bucket in ("uncovered", "partial")
+        for c in clusters.get(bucket, [])
+        if "classified" in (c.get("trail_categories") or [])
+        and c.get("coverage_percentage", 0) < 70
+    ]
+    if not remaining:
+        return False
+    return any(strategy not in tested_strategies for strategy in (
+        "classified_trail_coverage", "spatial_trail_diversity", "balanced"
+    ))
+
+
+def _build_adaptive_variant(
+    strategy: str,
+    clusters: list[dict[str, Any]],
+    analyzed: list[dict[str, Any]],
+    used_cluster_ids: set[int],
+    used_signatures: set[tuple],
+    current_waypoints: list[list[float]],
+) -> dict[str, Any] | None:
+    # Reuse is allowed; only the exact cluster/waypoint signature is forbidden.
+    candidates = [c for c in analyzed if c.get("coverage_percentage", 0) < 70]
+    candidates = [c for c in candidates if "classified" in (c.get("trail_categories") or [])]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (c.get("coverage_percentage", 0), -c.get("total_length_km", 0)))
+    if strategy in {"distance_aware", "balanced"}:
+        candidates.sort(key=lambda c: c.get("total_length_km", 0), reverse=True)
+    if strategy == "spatial_trail_diversity" and used_cluster_ids:
+        prior = [clusters[i].get("center", {}) for i in used_cluster_ids if i < len(clusters)]
+        def dist(c: dict[str, Any]) -> float:
+            center = c.get("center", {})
+            return min((_haversine_km(center.get("lat", 0), center.get("lng", 0), p.get("lat", 0), p.get("lng", 0)) for p in prior), default=0)
+        candidates.sort(key=lambda c: (dist(c), -c.get("coverage_percentage", 0), c.get("total_length_km", 0)), reverse=True)
+    # Try alternate pairs when the preferred pair duplicates a prior variant.
+    for selected in combinations(candidates, min(2, len(candidates))):
+        waypoints: list[list[float]] = []
+        selected_ids: list[int] = []
+        for c in selected:
+            idx = c.get("cluster_index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(clusters):
+                continue
+            cl = clusters[idx]
+            selected_ids.append(idx)
+            entry, exit_ = cl.get("start", {}), cl.get("end", {})
+            point = entry if entry else exit_
+            if point and point.get("lat") is not None and point.get("lng") is not None:
+                waypoints.append([round(float(point["lat"]), 6), round(float(point["lng"]), 6)])
+        sig = _candidate_waypoint_signature(selected_ids, waypoints)
+        if waypoints and sig not in used_signatures:
+            return {"strategy": strategy, "selected_cluster_ids": selected_ids, "excluded_cluster_ids": sorted(used_cluster_ids), "waypoints": waypoints, "signature": sig}
+    return None
+
+
+def _distance_strategy_needed(route: dict[str, Any]) -> bool:
+    """Whether a soft distance target still warrants another strategy."""
+    constraints = route.get("selection_constraints") or {}
+    distance = route.get("distance_km")
+    if not isinstance(distance, (int, float)):
+        return False
+    minimum = constraints.get("min_distance_km")
+    maximum = constraints.get("max_distance_km")
+    return ((isinstance(minimum, (int, float)) and distance < minimum)
+            or (isinstance(maximum, (int, float)) and distance > maximum))
+
+
+async def _run_adaptive_variant_controller(
+    initial_coordinates: list[list[float]], sport: str, discovered_segments: list[dict[str, Any]],
+    discovered_clusters: list[dict[str, Any]], plan_route_fn: Any,
+    selection_constraints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    constraints = selection_constraints or {}
+    results: list[dict[str, Any]] = []
+    audit: list[dict[str, Any]] = []
+    used_ids: set[int] = set()
+    used_sigs: set[tuple] = set()
+    tested_strategies: set[str] = set()
+    strategies = ["baseline", "classified_trail_coverage", "spatial_trail_diversity", "distance_aware", "balanced"]
+    feedback_transitions: list[dict[str, Any]] = []
+    for attempt in range(1, MAX_ADAPTIVE_ROUTING_CALLS + 1):
+        if attempt == 1:
+            plan = {"strategy": "baseline", "selected_cluster_ids": [], "excluded_cluster_ids": [], "waypoints": [], "signature": ((), ())}
+        else:
+            prior = results[-1]
+            analyzed = _build_analyzed_from_clusters(prior.get("trail_clusters") or {})
+            strategy = _adaptive_strategy_order(prior, tested_strategies)[0] if _adaptive_strategy_order(prior, tested_strategies) else strategies[attempt - 1]
+            plan = _build_adaptive_variant(strategy, discovered_clusters, analyzed, used_ids, used_sigs, initial_coordinates)
+            if plan is None:
+                break
+        coords = [list(c) for c in initial_coordinates] + [list(w) for w in plan["waypoints"]]
+        route = await plan_route_fn(coords, sport=sport, compact=True, discovered_segments=discovered_segments, discovered_clusters=discovered_clusters, **constraints)
+        route["_attempt"] = attempt
+        route["variant_id"] = f"variant_{attempt}"
+        route["strategy"] = plan["strategy"]
+        tested_strategies.add(plan["strategy"])
+        route["selection_constraints"] = constraints
+        route["_waypoints"] = coords
+        route["variant_specific_waypoints"] = [list(w) for w in plan["waypoints"]]
+        route["selected_cluster_ids"] = plan["selected_cluster_ids"]
+        route["route_fingerprint"] = (route.get("_route_geometry_fingerprint") or {}).get("hash")
+        similarities = [_geometry_similarity_pct(route.get("_route_geometry_fingerprint") or {}, old.get("_route_geometry_fingerprint") or {}) for old in results]
+        route["geometry_similarity"] = {str(i + 1): p for i, p in enumerate(similarities)}
+        max_similarity = max(similarities, default=0.0)
+        if max_similarity >= ROUTE_REDUNDANCY_OVERLAP_PCT:
+            status = "rejected_duplicate"
+        elif _adaptive_hard_violations(route, constraints):
+            status = "rejected_constraint"
+        else:
+            status = "accepted"
+        route["candidate_status"] = status
+        route["attempt_reason"] = f"adaptive strategy: {plan['strategy']}"
+        excluded_ids = plan["excluded_cluster_ids"]
+        route["excluded_cluster_reason"] = (
+            {str(cluster_id): "previously selected in another variant; excluded to diversify cluster combinations"
+             for cluster_id in excluded_ids}
+            if excluded_ids else {}
+        )
+        audit.append({
+            "variant_id": route["variant_id"], "strategy": plan["strategy"],
+            "selected_cluster_ids": plan["selected_cluster_ids"],
+            "excluded_cluster_ids": plan["excluded_cluster_ids"],
+            "excluded_cluster_reason": route["excluded_cluster_reason"],
+            "candidate_status": status, "attempt_reason": route["attempt_reason"],
+            "variant_waypoints": route["variant_specific_waypoints"],
+            "route_fingerprint": route.get("route_fingerprint"),
+            "similarity_to_existing": route["geometry_similarity"],
+            "selected_waypoints": route["variant_specific_waypoints"],
+        })
+        results.append(route)
+        if len(results) > 1:
+            feedback_transitions.append(_build_feedback_transition(results[-2], results[-1]))
+        used_ids.update(plan["selected_cluster_ids"])
+        used_sigs.add(plan["signature"])
+        if status == "accepted":
+            if not any(r.get("candidate_status") == "accepted_best" for r in results):
+                route["candidate_status"] = "accepted_best"
+            else:
+                best = next(r for r in results if r.get("candidate_status") == "accepted_best")
+                if _adaptive_route_better(route, best, constraints):
+                    best["candidate_status"] = "accepted"
+                    route["candidate_status"] = "accepted_best"
+        if attempt < MAX_ADAPTIVE_ROUTING_CALLS and not _adaptive_has_meaningful_next_strategy(route, tested_strategies, constraints):
+            break
+    valid = [r for r in results if r.get("candidate_status") in {"accepted", "accepted_best"}]
+    if not valid and results:
+        valid = [r for r in results if r.get("candidate_status") != "rejected_duplicate"] or results
+    selected = min(valid, key=lambda r: r.get("_attempt", 999)) if not valid else valid[0]
+    for r in valid[1:]:
+        if _adaptive_route_better(r, selected, constraints):
+            selected = r
+    for entry in audit:
+        entry["candidate_status"] = next(
+            (r.get("candidate_status") for r in results if r.get("variant_id") == entry.get("variant_id")),
+            entry.get("candidate_status"),
+        )
+        entry["selected"] = entry.get("variant_id") == selected.get("variant_id")
+    best = selected
+    return {"status": "feedback_complete", "best_route": best, "iterations": results, "total_attempts": len(results), "feedback_decisions": audit, "feedback_transitions": feedback_transitions}
 
 
 async def _run_feedback_loop(
@@ -1329,7 +1645,7 @@ def _compact_route_summary(
                 if isinstance(item, dict) and "type" in item and "amount" in item
             }
 
-    # Singletrail (from _embedded.way_types.items + coordinates)
+    # Singletrail (from _embedded.way_type items + coordinates)
     embedded = raw.get("_embedded", {})
     if isinstance(embedded, dict):
         wt_container = embedded.get("way_types", {})
@@ -1360,6 +1676,25 @@ def _compact_route_summary(
 
         # Route overlap — detect duplicate track sections
         result["route_overlap"] = _compute_route_overlap(coord_items)
+        result["_route_geometry_fingerprint"] = _route_geometry_fingerprint(coord_items)
+
+    # Normalized metrics. Discovery coverage is added separately below and is
+    # intentionally not part of classified-trail metrics.
+    surface_data = result.get("surfaces") or {}
+    singletrail_data = result.get("singletrail") or {}
+
+    def _surface_value(name: str, field: str) -> float:
+        value = surface_data.get(name, {})
+        return float(value.get(field, 0.0)) if isinstance(value, dict) else 0.0
+
+    result["route_quality_metrics"] = {
+        "classified_trail_km": round(float(singletrail_data.get("singletrail_total_km", 0.0)), 2),
+        "classified_trail_percentage": round(float(singletrail_data.get("singletrail_percentage", 0.0)), 1),
+        "surface_offroad_km": round(sum(_surface_value(k, "distance_km") for k in ("unpaved", "gravel", "nature")), 2),
+        "surface_offroad_percentage": round(sum(_surface_value(k, "percentage") for k in ("unpaved", "gravel", "nature")), 1),
+        "asphalt_km": round(_surface_value("asphalt", "distance_km"), 2),
+        "asphalt_percentage": round(_surface_value("asphalt", "percentage"), 1),
+    }
 
     # Segments
     segs = raw.get("segments", [])
@@ -1402,6 +1737,8 @@ def _compact_route_summary(
                 result["trail_coverage"] = _compute_trail_coverage(
                     coord_items, discovered_segments
                 )
+                # Explicit name prevents confusion with routed classified trail.
+                result["discovery_trail_coverage"] = result["trail_coverage"]
 
                 if discovered_clusters:
                     analyzed = analyze_cluster_coverage(
@@ -1680,8 +2017,9 @@ def register(mcp, client: KomootClient) -> None:
                                  cluster_trail_segments()). Quand fournis avec
                                  discovered_segments, le resume contient aussi
                                  trail_clusters (covered/partial/uncovered).
-            feedback_loop: si True, lance une optimisation iterative avec jusqu'a
-                           3 tentatives de routage guidees par trail_coverage.
+            feedback_loop: si True, lance le controleur adaptatif avec jusqu'a
+                           5 candidats de routage independants guides par les
+                           contraintes, les trails decouverts et la distance.
                            Necessite discovered_segments. Defaut: False.
             min_distance_km: Distance minimale souhaitee (hard constraint
                              de selection, pas de routage Komoot).
@@ -1704,12 +2042,11 @@ def register(mcp, client: KomootClient) -> None:
 
         # ── Feedback loop mode ────────────────────────────────────
         if feedback_loop:
-            return await _run_feedback_loop(
+            return await _run_adaptive_variant_controller(
                 coordinates, sport,
                 discovered_segments or [],
                 discovered_clusters or [],
                 plan_route,
-                max_iterations=3,
                 selection_constraints=selection_constraints if selection_constraints else None,
             )
 
@@ -1753,6 +2090,9 @@ def register(mcp, client: KomootClient) -> None:
         summary = _compact_route_summary(
             result, discovered_segments, discovered_clusters,
         )
+        # Geometry fingerprints are controller-internal and must not inflate
+        # the public compact=False response; the full route remains cached.
+        summary.pop("_route_geometry_fingerprint", None)
         summary["route_ref"] = route_ref
         return summary
 
