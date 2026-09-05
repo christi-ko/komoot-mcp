@@ -936,12 +936,211 @@ def _feedback_iteration_summary(
         summary["way_types"] = iteration["way_types"]
     if "route_quality_metrics" in iteration:
         summary["route_quality_metrics"] = iteration["route_quality_metrics"]
+    if "planning_audit" in iteration:
+        summary["planning_audit"] = iteration["planning_audit"]
     for key in ("variant_id", "strategy", "selected_cluster_ids", "candidate_status",
                 "route_fingerprint", "geometry_similarity", "variant_specific_waypoints"):
         if key in iteration:
             summary[key] = iteration[key]
 
     return summary
+
+
+def _build_route_coordinates(initial_coordinates: list[list[float]], variant_specific_waypoints: list[list[float]], route_mode: str = "auto") -> list[list[float]]:
+    """Build an independent route while preserving explicit round trips."""
+    if not initial_coordinates:
+        return [list(point) for point in variant_specific_waypoints]
+    start, first, last = list(initial_coordinates[0]), list(initial_coordinates[0]), list(initial_coordinates[-1])
+    is_roundtrip = route_mode == "roundtrip" or (route_mode == "auto" and len(initial_coordinates) > 1 and _haversine_km(first[0], first[1], last[0], last[1]) <= 0.5)
+    if is_roundtrip:
+        return [start, *[list(point) for point in initial_coordinates[1:-1]], *[list(point) for point in variant_specific_waypoints], start]
+    return [*[list(point) for point in initial_coordinates[:-1]], *[list(point) for point in variant_specific_waypoints], last]
+
+
+def _detect_backtracking(coordinates: list[list[float]], tolerance_km: float = 0.05) -> bool:
+    """Detect a route that returns to an earlier point away from the closure."""
+    route_points = coordinates[:-1] if len(coordinates) > 3 and coordinates[0] == coordinates[-1] else coordinates
+    for index, point in enumerate(route_points):
+        for prior in route_points[:max(0, index - 1)]:
+            if _haversine_km(float(point[0]), float(point[1]), float(prior[0]), float(prior[1])) <= tolerance_km:
+                return True
+    return False
+
+
+def _planning_audit(
+    route: dict[str, Any],
+    coordinates: list[list[float]],
+    trail_areas: list[dict[str, Any]],
+    clusters: list[dict[str, Any]],
+    selected_cluster_ids: list[int],
+    connection_segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a conservative planning audit from route and discovery data."""
+    closed = bool(coordinates and coordinates[0] == coordinates[-1])
+    q = route.get("route_quality_metrics") or {}
+    cov = (route.get("trail_coverage") or {}).get("classified") or {}
+    direction = [_classify_trail_direction(
+        (clusters[i].get("start") or {}).get("alt"),
+        (clusters[i].get("end") or {}).get("alt"),
+    ) for i in selected_cluster_ids if 0 <= i < len(clusters)]
+    way_audit = _connection_waytype_audit(
+        route.get("way_types"),
+        comparison_available=bool(route.get("comparison_route_available", False)),
+    )
+    return {
+        "route_mode": "roundtrip" if closed else "point_to_point",
+        "roundtrip_closed": closed,
+        "start_coordinate": coordinates[0] if coordinates else None,
+        "end_coordinate": coordinates[-1] if coordinates else None,
+        "trail_area_sequence": [next((a.get("area_id") for a in trail_areas if i in a.get("cluster_indices", [])), None) for i in selected_cluster_ids],
+        "cluster_sequence": list(selected_cluster_ids),
+        "area_sequence": [next((a.get("area_id") for a in trail_areas if i in a.get("cluster_indices", [])), None) for i in selected_cluster_ids],
+        "connection_plan": connection_segments,
+        "entry_exit_plan": [{"cluster_id": i, "entry_point": clusters[i].get("start"), "exit_point": clusters[i].get("end"), "preferred_direction": direction[n] if n < len(direction) else "direction_unknown", "direction_status": direction[n] if n < len(direction) else "direction_unknown", "steepness_status": clusters[i].get("steepness_status", "unknown"), "difficulty_status": clusters[i].get("difficulty_status", "unknown"), "role": "trail_area"} for n, i in enumerate(selected_cluster_ids) if 0 <= i < len(clusters)],
+        "direction_status": direction if direction else ["direction_unknown"],
+        "steepness_status": [clusters[i].get("steepness_status", "unknown") for i in selected_cluster_ids if 0 <= i < len(clusters)],
+        "difficulty_status": [clusters[i].get("difficulty_status", "unknown") for i in selected_cluster_ids if 0 <= i < len(clusters)],
+        "connection_segments": connection_segments,
+        "connection_way_types": way_audit["way_types"],
+        "cycleway_present": way_audit["cycleway_present"],
+        "local_road_present": way_audit["local_road_present"],
+        "major_road_present": way_audit["major_road_present"],
+        "major_road_avoidable": way_audit["major_road_avoidable"],
+        "backtracking_detected": _detect_backtracking(coordinates),
+        "route_overlap": route.get("route_overlap", "unknown"),
+        "classified_trail_km": q.get("classified_trail_km", "unknown"),
+        "surface_offroad_km": q.get("surface_offroad_km", "unknown"),
+        "discovery_trail_coverage": cov.get("coverage_percentage", "unknown"),
+        "distance": route.get("distance_km", "unknown"),
+        "elevation": route.get("elevation_up_m", "unknown"),
+        "T/C": {"technical": route.get("technical_difficulty", "unknown"), "fitness": route.get("fitness_difficulty", "unknown")},
+        "asphalt": (route.get("surfaces") or {}).get("asphalt", "unknown"),
+        "geometry_similarity": route.get("geometry_similarity", "unknown"),
+    }
+
+
+def _connection_waytype_audit(
+    way_types: dict[str, Any] | list[Any] | None,
+    comparison_available: bool = True,
+) -> dict[str, Any]:
+    """Summarize objective route way types for inter-area connections."""
+    if isinstance(way_types, dict):
+        names = {str(name).lower() for name in way_types}
+    else:
+        names = {str(item.get("type", item) if isinstance(item, dict) else item).lower().replace("wt#", "") for item in (way_types or [])}
+    cycleway = any("cycleway" in name or "bicycle" in name for name in names)
+    local = any(name in names for name in {"minor_road", "residential", "living_street", "track", "path", "street"})
+    major = any(name in names for name in {"highway", "primary", "secondary", "trunk", "motorway"})
+    return {
+        "cycleway_present": cycleway,
+        "local_road_present": local,
+        "major_road_present": major,
+        "major_road_avoidable": (not major) if comparison_available else "unknown",
+        "way_types": sorted(names),
+    }
+
+
+def _classify_trail_direction(start_elevation_m: float | None, end_elevation_m: float | None, flat_threshold_m: float = 5.0) -> str:
+    """Classify direction without inventing one when elevations are absent."""
+    if not isinstance(start_elevation_m, (int, float)) or not isinstance(end_elevation_m, (int, float)):
+        return "direction_unknown"
+    delta = float(start_elevation_m) - float(end_elevation_m)
+    if delta >= flat_threshold_m:
+        return "downhill_start_to_end"
+    if delta <= -flat_threshold_m:
+        return "downhill_end_to_start"
+    return "approach_or_bidirectional"
+
+
+def _plan_trail_areas(clusters: list[dict[str, Any]], proximity_km: float = 1.5) -> list[dict[str, Any]]:
+    """Group clusters into stable connected components using a proximity graph."""
+    if not clusters:
+        return []
+    centers = []
+    for cluster in clusters:
+        start, end = cluster.get("start", {}), cluster.get("end", {})
+        centers.append(cluster.get("center") or {"lat": (float(start.get("lat", 0)) + float(end.get("lat", 0))) / 2, "lng": (float(start.get("lng", 0)) + float(end.get("lng", 0))) / 2})
+    parent = list(range(len(clusters)))
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parent[right] = left
+    for left in range(len(clusters)):
+        for right in range(left + 1, len(clusters)):
+            if _haversine_km(centers[left]["lat"], centers[left]["lng"], centers[right]["lat"], centers[right]["lng"]) <= proximity_km:
+                union(left, right)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(clusters)):
+        groups.setdefault(find(index), []).append(index)
+    areas = []
+    for area_id, indices in enumerate(sorted(groups.values(), key=lambda group: min(group))):
+        lat = sum(centers[index]["lat"] for index in indices) / len(indices)
+        lng = sum(centers[index]["lng"] for index in indices) / len(indices)
+        areas.append({"area_id": area_id, "cluster_indices": indices, "center": {"lat": lat, "lng": lng}, "classified_trail_km": sum(float(clusters[index].get("total_length_km", 0) or 0) for index in indices)})
+    return areas
+
+
+def _cluster_entry_exit(cluster: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Choose conservative trail entry/exit points from available elevation."""
+    start = cluster.get("start") or {}
+    end = cluster.get("end") or {}
+    direction = _classify_trail_direction(start.get("alt"), end.get("alt"))
+    if direction == "downhill_end_to_start":
+        return end, start, direction
+    return start, end, direction
+
+
+def _build_area_chain(
+    areas: list[dict[str, Any]],
+    clusters: list[dict[str, Any]],
+    cluster_sequence: list[int],
+) -> dict[str, Any]:
+    """Build a directed area/cluster plan before routing."""
+    area_sequence: list[int] = []
+    for cluster_id in cluster_sequence:
+        area_id = next((a.get("area_id") for a in areas if cluster_id in a.get("cluster_indices", [])), None)
+        if area_id is not None and (not area_sequence or area_sequence[-1] != area_id):
+            area_sequence.append(area_id)
+    entry_exit_plan = []
+    for cluster_id in cluster_sequence:
+        cluster = clusters[cluster_id]
+        entry, exit_, direction = _cluster_entry_exit(cluster)
+        entry_exit_plan.append({
+            "cluster_id": cluster_id,
+            "entry_point": entry,
+            "exit_point": exit_,
+            "preferred_direction": direction,
+            "direction_status": direction,
+            "steepness_status": cluster.get("steepness_status", "unknown"),
+            "difficulty_status": cluster.get("difficulty_status", "unknown"),
+            "role": "trail_area",
+        })
+    connection_plan = [
+        {"from_area": area_sequence[i], "to_area": area_sequence[i + 1], "role": "area_to_area_connection"}
+        for i in range(len(area_sequence) - 1)
+    ]
+    return {
+        "area_sequence": area_sequence,
+        "cluster_sequence": list(cluster_sequence),
+        "entry_exit_plan": entry_exit_plan,
+        "connection_plan": connection_plan,
+    }
+
+
+def _ordered_area_waypoints(area: dict[str, Any], clusters: list[dict[str, Any]]) -> list[list[float]]:
+    """Return ordered entry points for a planned forest/trail area."""
+    points: list[list[float]] = []
+    for index in area.get("cluster_indices", []):
+        cluster = clusters[index]
+        point = cluster.get("start") or cluster.get("end") or {}
+        if point.get("lat") is not None and point.get("lng") is not None:
+            points.append([round(float(point["lat"]), 6), round(float(point["lng"]), 6)])
+    return points
 
 
 def _candidate_waypoint_signature(cluster_ids: list[int], waypoints: list[list[float]]) -> tuple:
@@ -963,6 +1162,8 @@ def _route_metrics(route: dict[str, Any]) -> dict[str, float]:
         )),
         "surface_offroad_km": float(q.get("surface_offroad_km", 0)),
         "asphalt_percentage": float(q.get("asphalt_percentage", 0)),
+        "major_road_present": bool(_connection_waytype_audit(route.get("way_types"))["major_road_present"]),
+        "cycleway_present": bool(_connection_waytype_audit(route.get("way_types"))["cycleway_present"]),
         "distance_km": float(route.get("distance_km", 0) or 0),
     }
 
@@ -991,7 +1192,12 @@ def _adaptive_route_better(a: dict[str, Any], b: dict[str, Any], constraints: di
     # only describes how much of the known candidate pool was reached.
     for key in ("classified_trail_km", "surface_offroad_km", "discovery_coverage", "covered_clusters"):
         if am[key] != bm[key]:
-            return am[key] > bm[key]
+            return bool(am[key] > bm[key])
+    if am["major_road_present"] != bm["major_road_present"]:
+        return not bool(am["major_road_present"])
+    if am["cycleway_present"] != bm["cycleway_present"]:
+        return bool(am["cycleway_present"])
+
     amin, amax = constraints.get("min_distance_km"), constraints.get("max_distance_km")
     if amin is None and amax is None:
         if am["asphalt_percentage"] != bm["asphalt_percentage"]:
@@ -1049,9 +1255,17 @@ def _adaptive_has_meaningful_next_strategy(
         and c.get("coverage_percentage", 0) < 70
     ]
     if not remaining:
+        # A route can cover every discovered cluster while still being
+        # materially outside the requested distance window. Keep searching
+        # with independent strategies until the distance target is feasible.
+        if _distance_strategy_needed({**route, "selection_constraints": constraints}):
+            return any(strategy not in tested_strategies for strategy in (
+                "classified_trail_coverage", "spatial_trail_diversity",
+                "distance_aware", "balanced",
+            ))
         return False
     return any(strategy not in tested_strategies for strategy in (
-        "classified_trail_coverage", "spatial_trail_diversity", "balanced"
+        "classified_trail_coverage", "spatial_trail_diversity", "distance_aware", "balanced"
     ))
 
 
@@ -1062,9 +1276,14 @@ def _build_adaptive_variant(
     used_cluster_ids: set[int],
     used_signatures: set[tuple],
     current_waypoints: list[list[float]],
+    trail_areas: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     # Reuse is allowed; only the exact cluster/waypoint signature is forbidden.
     candidates = [c for c in analyzed if c.get("coverage_percentage", 0) < 70]
+    if strategy == "distance_aware" and not candidates:
+        # Distance recovery may need to revisit already covered clusters;
+        # coverage completion alone must not suppress longer variants.
+        candidates = list(analyzed)
     candidates = [c for c in candidates if "classified" in (c.get("trail_categories") or [])]
     if not candidates:
         return None
@@ -1077,6 +1296,26 @@ def _build_adaptive_variant(
             center = c.get("center", {})
             return min((_haversine_km(center.get("lat", 0), center.get("lng", 0), p.get("lat", 0), p.get("lng", 0)) for p in prior), default=0)
         candidates.sort(key=lambda c: (dist(c), -c.get("coverage_percentage", 0), c.get("total_length_km", 0)), reverse=True)
+    # Prefer candidates from one planned area, then adjacent areas, instead
+    # of selecting unrelated clusters solely by trail length.
+    if trail_areas:
+        area_by_cluster = {
+            idx: area.get("area_id")
+            for area in trail_areas
+            for idx in area.get("cluster_indices", [])
+        }
+        start = current_waypoints[0] if current_waypoints else None
+        area_distance = {
+            area.get("area_id"): (
+                _haversine_km(float(start[0]), float(start[1]), area["center"]["lat"], area["center"]["lng"])
+                if start else float(area.get("area_id", 999))
+            )
+            for area in trail_areas
+        }
+        candidates.sort(key=lambda c: (
+            area_distance.get(area_by_cluster.get(c.get("cluster_index")), float("inf")),
+            c.get("coverage_percentage", 0),
+        ))
     # Try alternate pairs when the preferred pair duplicates a prior variant.
     for selected in combinations(candidates, min(2, len(candidates))):
         waypoints: list[list[float]] = []
@@ -1087,13 +1326,20 @@ def _build_adaptive_variant(
                 continue
             cl = clusters[idx]
             selected_ids.append(idx)
-            entry, exit_ = cl.get("start", {}), cl.get("end", {})
-            point = entry if entry else exit_
-            if point and point.get("lat") is not None and point.get("lng") is not None:
-                waypoints.append([round(float(point["lat"]), 6), round(float(point["lng"]), 6)])
+            entry, exit_, _ = _cluster_entry_exit(cl)
+            for point in (entry, exit_):
+                if point and point.get("lat") is not None and point.get("lng") is not None:
+                    waypoints.append([round(float(point["lat"]), 6), round(float(point["lng"]), 6)])
         sig = _candidate_waypoint_signature(selected_ids, waypoints)
         if waypoints and sig not in used_signatures:
-            return {"strategy": strategy, "selected_cluster_ids": selected_ids, "excluded_cluster_ids": sorted(used_cluster_ids), "waypoints": waypoints, "signature": sig}
+            chain = _build_area_chain(trail_areas or [], clusters, selected_ids)
+            chain_waypoints: list[list[float]] = []
+            for item in chain["entry_exit_plan"]:
+                for key in ("entry_point", "exit_point"):
+                    point = item.get(key) or {}
+                    if point.get("lat") is not None and point.get("lng") is not None:
+                        chain_waypoints.append([round(float(point["lat"]), 6), round(float(point["lng"]), 6)])
+            return {"strategy": strategy, "selected_cluster_ids": selected_ids, "excluded_cluster_ids": sorted(used_cluster_ids), "waypoints": chain_waypoints or waypoints, "signature": _candidate_waypoint_signature(selected_ids, chain_waypoints or waypoints), **chain}
     return None
 
 
@@ -1120,6 +1366,12 @@ async def _run_adaptive_variant_controller(
     used_ids: set[int] = set()
     used_sigs: set[tuple] = set()
     tested_strategies: set[str] = set()
+    trail_areas = _plan_trail_areas(discovered_clusters)
+    cluster_area = {
+        cluster_index: area["area_id"]
+        for area in trail_areas
+        for cluster_index in area["cluster_indices"]
+    }
     strategies = ["baseline", "classified_trail_coverage", "spatial_trail_diversity", "distance_aware", "balanced"]
     feedback_transitions: list[dict[str, Any]] = []
     for attempt in range(1, MAX_ADAPTIVE_ROUTING_CALLS + 1):
@@ -1128,12 +1380,25 @@ async def _run_adaptive_variant_controller(
         else:
             prior = results[-1]
             analyzed = _build_analyzed_from_clusters(prior.get("trail_clusters") or {})
-            strategy = _adaptive_strategy_order(prior, tested_strategies)[0] if _adaptive_strategy_order(prior, tested_strategies) else strategies[attempt - 1]
-            plan = _build_adaptive_variant(strategy, discovered_clusters, analyzed, used_ids, used_sigs, initial_coordinates)
+            strategy_order = _adaptive_strategy_order(prior, tested_strategies)
+            if not strategy_order:
+                break
+            strategy = strategy_order[0]
+            plan = _build_adaptive_variant(strategy, discovered_clusters, analyzed, used_ids, used_sigs, initial_coordinates, trail_areas=trail_areas)
             if plan is None:
                 break
-        coords = [list(c) for c in initial_coordinates] + [list(w) for w in plan["waypoints"]]
+        coords = _build_route_coordinates(initial_coordinates, plan["waypoints"], "auto")
         route = await plan_route_fn(coords, sport=sport, compact=True, discovered_segments=discovered_segments, discovered_clusters=discovered_clusters, **constraints)
+        route["route_mode"] = "roundtrip" if coords and coords[0] == coords[-1] else "point_to_point"
+        route["roundtrip_closed"] = bool(coords and coords[0] == coords[-1])
+        route["comparison_route_available"] = attempt > 1
+        route["trail_area_sequence"] = [cluster_area.get(cluster_id) for cluster_id in plan["selected_cluster_ids"]]
+        route["planning_audit"] = _planning_audit(
+            route, coords, trail_areas, discovered_clusters,
+            plan["selected_cluster_ids"], [],
+        )
+        route["planning_audit"]["connection_policy"] = ["cycleway", "forest_or_economic_road", "quiet_local_road", "major_road_last_resort"]
+        route["planning_audit"]["connection_waytype_audit"] = _connection_waytype_audit(route.get("way_types"), comparison_available=attempt > 1)
         route["_attempt"] = attempt
         route["variant_id"] = f"variant_{attempt}"
         route["strategy"] = plan["strategy"]
@@ -1418,6 +1683,7 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
          + math.cos(math.radians(lat1))
          * math.cos(math.radians(lat2))
          * math.sin(dlon / 2) ** 2)
+    a = max(0.0, min(1.0, a))
     return R * 2 * math.asin(math.sqrt(a))
 
 
